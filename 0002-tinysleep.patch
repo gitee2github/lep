@@ -1,0 +1,269 @@
+Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 and
+only version 2 as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+---
+ arch/x86/ia32/ia32entry.S        |   1 +
+ arch/x86/include/asm/unistd_64.h |   2 +
+ include/linux/rtos/tinysleep.h   |   8 ++
+ init/Kconfig                     |   5 ++
+ kernel/Makefile                  |   2 +-
+ kernel/tinysleep.c               | 172 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 189 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/rtos/tinysleep.h
+ create mode 100644 kernel/tinysleep.c
+
+diff --git a/arch/x86/ia32/ia32entry.S b/arch/x86/ia32/ia32entry.S
+index 4f5f71e0..2d6fd3d7 100644
+--- a/arch/x86/ia32/ia32entry.S
++++ b/arch/x86/ia32/ia32entry.S
+@@ -848,4 +848,5 @@ ia32_sys_call_table:
+ 	.quad compat_sys_rt_tgsigqueueinfo	/* 335 */
+ 	.quad sys_perf_event_open
+ 	.quad compat_sys_recvmmsg
++	.quad sys32_mwait			/* 338 */
+ ia32_syscall_end:
+diff --git a/arch/x86/include/asm/unistd_64.h b/arch/x86/include/asm/unistd_64.h
+index ff4307b0..ddbd0dad 100644
+--- a/arch/x86/include/asm/unistd_64.h
++++ b/arch/x86/include/asm/unistd_64.h
+@@ -663,6 +663,8 @@ __SYSCALL(__NR_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo)
+ __SYSCALL(__NR_perf_event_open, sys_perf_event_open)
+ #define __NR_recvmmsg				299
+ __SYSCALL(__NR_recvmmsg, sys_recvmmsg)
++#define __NR_mwait				300
++__SYSCALL(__NR_mwait, sys_mwait)
+ 
+ #ifndef __NO_STUBS
+ #define __ARCH_WANT_OLD_READDIR
+diff --git a/include/linux/rtos/tinysleep.h b/include/linux/rtos/tinysleep.h
+new file mode 100644
+index 00000000..06844add
+--- /dev/null
++++ b/include/linux/rtos/tinysleep.h
+@@ -0,0 +1,8 @@
++#ifndef __TINYSLEEP_H__
++#define __TINYSLEEP_H__
++
++#ifdef CONFIG_MWAIT_TINYSLEEP
++extern void tinysleep_wakeup(unsigned int cpu);
++#endif
++
++#endif
+diff --git a/init/Kconfig b/init/Kconfig
+index 04e486cf..09ab3fe4 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -23,6 +23,11 @@ config CONSTRUCTORS
+ 
+ menu "General setup"
+ 
++config MWAIT_TINYSLEEP
++	bool "Tinysleep based on mwait"
++	depends on X86
++	default y
++
+ config EXPERIMENTAL
+ 	bool "Prompt for development and/or incomplete code/drivers"
+ 	---help---
+diff --git a/kernel/Makefile b/kernel/Makefile
+index a987aa16..b8f46504 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = sched.o fork.o exec_domain.o panic.o printk.o \
+ 	    kthread.o wait.o kfifo.o sys_ni.o posix-cpu-timers.o mutex.o \
+ 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
+ 	    notifier.o ksysfs.o pm_qos_params.o sched_clock.o cred.o \
+-	    async.o range.o
++	    async.o range.o tinysleep.o
+ obj-$(CONFIG_HAVE_EARLY_RES) += early_res.o
+ obj-y += groups.o
+ 
+diff --git a/kernel/tinysleep.c b/kernel/tinysleep.c
+new file mode 100644
+index 00000000..f67e6de1
+--- /dev/null
++++ b/kernel/tinysleep.c
+@@ -0,0 +1,172 @@
++#include <linux/kthread.h>
++#include <linux/cpu.h>
++#include <linux/rtos/tinysleep.h>
++
++#ifdef CONFIG_MWAIT_TINYSLEEP
++
++#define TINYSLEEP_CACHE_LINE_OFFSET	4
++
++#define TINYSLEEP_RPINTK(arg, ...) printk(KERN_INFO "tinysleep:"arg, ##__VA_ARGS__)
++
++unsigned long long tinysleep_wait_addr[NR_CPUS * 16] __attribute__((__aligned__(128)));
++
++static DEFINE_PER_CPU(struct task_struct *, ktinysleep_schedd);
++
++static int tinysleep_scheduler_interval = 10;
++
++void tinysleep_wakeup(unsigned int cpu)
++{
++	if (cpu >= NR_CPUS) {
++		TINYSLEEP_RPINTK("tinysleep_wakeup error: cpu %u is >= %u\n", cpu, NR_CPUS);
++		return;
++	}
++
++	if (!cpu_online(cpu)) {
++		TINYSLEEP_RPINTK("tinysleep_wakeup error: cpu %u is not online\n", cpu);
++		return;
++	}
++
++	tinysleep_wait_addr[cpu << TINYSLEEP_CACHE_LINE_OFFSET] = 0x01;
++}
++EXPORT_SYMBOL(tinysleep_wakeup);
++
++static inline int do_mwait(void)
++{
++	unsigned int cpuid;
++	unsigned long long *cpu_addr;
++
++	preempt_disable();
++
++	cpuid = smp_processor_id();
++	cpu_addr = &tinysleep_wait_addr[cpuid << TINYSLEEP_CACHE_LINE_OFFSET];
++
++	if (likely(cpu_has(&current_cpu_data, X86_FEATURE_CLFLUSH_MONITOR)))
++		clflush((void *)cpu_addr);
++
++	__monitor((void *)cpu_addr, 0, 0);
++	smp_mb();
++	__sti_mwait(0, 0);
++
++	preempt_enable();
++
++	return 0;
++}
++
++asmlinkage long sys_mwait(void)
++{
++	return do_mwait();
++}
++
++asmlinkage int sys32_mwait(int cmd, unsigned long addr)
++{
++	return do_mwait();
++}
++
++static int __init tinysleep_scheduler_setup(char *str)
++{
++	int val;
++
++	get_option(&str, &val);
++	if (val > INT_MAX) {
++		val = INT_MAX;
++		TINYSLEEP_RPINTK("tinysleep_scheduler_interval=%s is out of range, use INT_MAX\n", str);
++	}
++
++	TINYSLEEP_RPINTK("tinysleep_scheduler_interval=%d, ktiny_schedd is %s\n", val,
++				val == 0 ? "disabled" : "enabled");
++	tinysleep_scheduler_interval = val;
++
++	return 1;
++}
++early_param("tinysleep_scheduler_interval", tinysleep_scheduler_setup);
++
++static int tinysleep_scheduler(void *data)
++{
++	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
++
++	sched_setscheduler(current, SCHED_FIFO, &param);
++	while (!kthread_should_stop())
++		msleep_interruptible(tinysleep_scheduler_interval);
++	return 0;
++}
++
++static int __cpuinit
++tinysleep_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
++{
++	int hotcpu = (uintptr_t)hcpu;
++	struct task_struct *p;
++
++	p = per_cpu(ktinysleep_schedd, hotcpu);
++	switch (action) {
++	case CPU_ONLINE:
++	case CPU_ONLINE_FROZEN:
++		if (p == NULL) {
++			p = kthread_create(tinysleep_scheduler, hcpu, "ktiny_schedd/%d", hotcpu);
++			if (IS_ERR(p)) {
++				TINYSLEEP_RPINTK("ktiny_schedd for cpu(%d) failed\n", hotcpu);
++				return NOTIFY_BAD;
++			}
++			kthread_bind(p, hotcpu);
++			per_cpu(ktinysleep_schedd, hotcpu) = p;
++		}
++		wake_up_process(p);
++		break;
++#ifdef CONFIG_HOTPLUG_CPU
++	case CPU_UP_CANCELED:
++	case CPU_UP_CANCELED_FROZEN:
++	case CPU_DEAD:
++	case CPU_DEAD_FROZEN:
++		if (NULL != p) {
++			per_cpu(ktinysleep_schedd, hotcpu) = NULL;
++			kthread_stop(p);
++		}
++		break;
++#endif
++	}
++	return NOTIFY_OK;
++}
++
++static struct notifier_block __cpuinitdata cpu_nfb = {
++	.notifier_call = tinysleep_cpu_callback
++};
++
++static int __init spawn_tinysleep_scheduler_task(void)
++{
++	void *cpu = (void *)(long)smp_processor_id();
++	int err;
++
++	if (0 == tinysleep_scheduler_interval) {
++		TINYSLEEP_RPINTK("we will not use tinysleep_scheduler to keep schedule\n");
++		return 0;
++	}
++
++	err = tinysleep_cpu_callback(&cpu_nfb, CPU_ONLINE, cpu);
++	if (err == NOTIFY_BAD) {
++		BUG();
++		return 1;
++	}
++
++	register_cpu_notifier(&cpu_nfb);
++
++	TINYSLEEP_RPINTK("Use tinysleep_scheduler to keep schedule\n");
++
++	return 0;
++}
++early_initcall(spawn_tinysleep_scheduler_task);
++
++#else /* CONFIG_MWAIT_TINYSLEEP */
++asmlinkage long sys_mwait(void)
++{
++	return -ENOSYS;
++}
++
++asmlinkage int sys32_mwait(int cmd, unsigned long addr)
++{
++	return -ENOSYS;
++}
++
++void tinysleep_wakeup(unsigned int cpu)
++{
++}
++
++#endif /* CONFIG_MWAIT_TINYSLEEP */
+-- 
+2.12.3
+
