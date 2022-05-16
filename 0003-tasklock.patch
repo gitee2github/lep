@@ -1,0 +1,627 @@
+Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 and
+only version 2 as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+---
+ include/linux/init_task.h                |   1 +
+ include/linux/rtos/task_struct_private.h |  15 ++
+ include/linux/rtos/tasklock.h            |  43 ++++
+ include/linux/sched.h                    |   3 +
+ kernel/Kconfig.preempt                   |   5 +
+ kernel/Makefile                          |   1 +
+ kernel/exit.c                            |   4 +
+ kernel/fork.c                            |   6 +
+ kernel/sched.c                           |   7 +
+ kernel/tasklock.c                        | 385 +++++++++++++++++++++++++++++++
+ kernel/timer.c                           |   3 +
+ 11 files changed, 473 insertions(+)
+ create mode 100644 include/linux/rtos/task_struct_private.h
+ create mode 100644 include/linux/rtos/tasklock.h
+ create mode 100644 kernel/tasklock.c
+
+diff --git a/include/linux/init_task.h b/include/linux/init_task.h
+index b1ed1cd8..67dbe869 100644
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -172,6 +172,7 @@ extern struct cred init_cred;
+ 	INIT_FTRACE_GRAPH						\
+ 	INIT_TRACE_RECURSION						\
+ 	INIT_TASK_RCU_PREEMPT(tsk)					\
++	INIT_RTOS_TASK_STRUCT_PRIVATE					\
+ }
+ 
+ 
+diff --git a/include/linux/rtos/task_struct_private.h b/include/linux/rtos/task_struct_private.h
+new file mode 100644
+index 00000000..14b520eb
+--- /dev/null
++++ b/include/linux/rtos/task_struct_private.h
+@@ -0,0 +1,15 @@
++#ifndef __TASK_STRUCT_PRIVATE_H__
++#define __TASK_STRUCT_PRIVATE_H__
++
++#include <linux/rtos/tasklock.h>
++/* called by INIT_TASK(), in init_task.h */
++#define INIT_RTOS_TASK_STRUCT_PRIVATE		\
++	.task_struct_private = {		\
++	INIT_RTOS_TASKLOCK			\
++},
++
++struct rtos_task_struct_t {
++	struct rtos_tasklock_t tasklock;
++};
++
++#endif
+diff --git a/include/linux/rtos/tasklock.h b/include/linux/rtos/tasklock.h
+new file mode 100644
+index 00000000..1c1c3bd0
+--- /dev/null
++++ b/include/linux/rtos/tasklock.h
+@@ -0,0 +1,43 @@
++#ifndef _LINUX_RTOS_TASKLOCK_H
++#define _LINUX_RTOS_TASKLOCK_H
++
++#ifdef CONFIG_RTOS_TASKLOCK
++#define TASKLOCK_ENABLE			1 /* preempt disable */
++#define TASKLOCK_DISABLE		0 /* preempt enable */
++#define TASKLOCK_TIMESTAMP_OFFSET	8 /* offset of the disable start value */
++#define TASKLOCK_NEED_SET_TIF		16 /* offset of value whether set the tif flag*/
++
++#define __get_tasklock_page(tsk)	\
++	tsk->task_struct_private.tasklock.tasklock_ctrl_page
++
++#define __get_tasklock_locktime(tsk)	\
++	(void *)((char *)__get_tasklock_page(tsk) + TASKLOCK_TIMESTAMP_OFFSET)
++
++#define __get_tasklock_set_tif(tsk)	\
++	(void *)((char *)__get_tasklock_page(tsk) + TASKLOCK_NEED_SET_TIF)
++
++/* Called by INIT_RTOS_TASK_STRUCT_PRIVATE */
++#define INIT_RTOS_TASKLOCK			\
++	.tasklock = {	.tasklock_ctrl_page = NULL,},
++
++/* referenced in struct rtos_task_struct_private_t */
++struct rtos_tasklock_t{
++	void	*tasklock_ctrl_page;
++};
++
++
++extern void tasklock_task_fork(struct task_struct *tsk);
++extern void tasklock_task_exit(struct task_struct *tsk);
++extern void tasklock_sched_tick(void);
++extern int tasklock_skip_sched(void);
++extern void tasklock_update_sched(void);
++
++#else	/* CONFIG_RTOS_TASKLOCK */
++#define INIT_RTOS_TASKLOCK
++
++struct rtos_tasklock_t{};
++
++#endif	/* CONFIG_RTOS_TASKLOCK */
++
++
++#endif	/* _LINUX_RTOS_TASKLOCK_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index c66e0af1..827bbf02 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -94,6 +94,8 @@ struct sched_param {
+ 
+ #include <asm/processor.h>
+ 
++#include <linux/rtos/task_struct_private.h>
++
+ struct exec_domain;
+ struct futex_pi_state;
+ struct robust_list_head;
+@@ -1499,6 +1501,7 @@ struct task_struct {
+ 	/* bitmask of trace recursion */
+ 	unsigned long trace_recursion;
+ #endif /* CONFIG_TRACING */
++	struct rtos_task_struct_t task_struct_private;
+ #ifdef CONFIG_CGROUP_MEM_RES_CTLR /* memcg uses this to do batch job */
+ 	struct memcg_batch_info {
+ 		int do_batch;	/* incremented when batch uncharge started */
+diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
+index bf987b95..211ee749 100644
+--- a/kernel/Kconfig.preempt
++++ b/kernel/Kconfig.preempt
+@@ -52,3 +52,8 @@ config PREEMPT
+ 
+ endchoice
+ 
++config RTOS_TASKLOCK
++	bool "Preemptible User space"
++	help
++	  This option create interface to disable/enabe preempt for user space.
++
+diff --git a/kernel/Makefile b/kernel/Makefile
+index b8f46504..d0ef3cf2 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -47,6 +47,7 @@ obj-$(CONFIG_USE_GENERIC_SMP_HELPERS) += smp.o
+ ifneq ($(CONFIG_SMP),y)
+ obj-y += up.o
+ endif
++obj-$(CONFIG_RTOS_TASKLOCK) += tasklock.o
+ obj-$(CONFIG_SMP) += spinlock.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+ obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 0dd27ca1..f86f8325 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -661,6 +661,10 @@ static void exit_mm(struct task_struct * tsk)
+ 	struct mm_struct *mm = tsk->mm;
+ 	struct core_state *core_state;
+ 
++#ifdef CONFIG_RTOS_TASKLOCK
++	tasklock_task_exit(tsk);
++#endif
++
+ 	mm_release(tsk, mm);
+ 	if (!mm)
+ 		return;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 32fdbd46..8e8f3701 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1248,12 +1248,18 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 		retval = -ERESTARTNOINTR;
+ 		goto bad_fork_free_pid;
+ 	}
++#ifdef CONFIG_RTOS_TASKLOCK
++	__get_tasklock_page(p) = NULL;
++#endif
+ 
+ 	if (clone_flags & CLONE_THREAD) {
+ 		atomic_inc(&current->signal->count);
+ 		atomic_inc(&current->signal->live);
+ 		p->group_leader = current->group_leader;
+ 		list_add_tail_rcu(&p->thread_group, &p->group_leader->thread_group);
++#ifdef CONFIG_RTOS_TASKLOCK
++		tasklock_task_fork(p);
++#endif
+ 	}
+ 
+ 	if (likely(p->pid)) {
+diff --git a/kernel/sched.c b/kernel/sched.c
+index 245458e5..d2e8304d 100644
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -3666,6 +3666,10 @@ asmlinkage void __sched schedule(void)
+ 	unsigned long *switch_count;
+ 	struct rq *rq;
+ 	int cpu;
++#ifdef CONFIG_RTOS_TASKLOCK
++	if (tasklock_skip_sched())
++		return;
++#endif
+ 
+ need_resched:
+ 	preempt_disable();
+@@ -3718,6 +3722,9 @@ need_resched_nonpreemptible:
+ 		 */
+ 		cpu = smp_processor_id();
+ 		rq = cpu_rq(cpu);
++#ifdef CONFIG_RTOS_TASKLOCK
++		tasklock_update_sched();
++#endif
+ 	} else
+ 		raw_spin_unlock_irq(&rq->lock);
+ 
+diff --git a/kernel/tasklock.c b/kernel/tasklock.c
+new file mode 100644
+index 00000000..6a5ee450
+--- /dev/null
++++ b/kernel/tasklock.c
+@@ -0,0 +1,385 @@
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/proc_fs.h>
++
++#include <linux/rtos/tasklock.h>
++
++#define SIGNAL_TASKLOCK_TIMEOUT		(SIGRTMIN + 16)
++#define NS_TO_MS_OFFSET_BITS		20
++
++struct sched_ctrl_us_dev {
++	dev_t devno;
++	struct cdev cdev;
++};
++
++static unsigned long min_timeout_ms;
++static unsigned long max_timeout_ms = HZ > 1000 ? ULONG_MAX / HZ * 1000 : ULONG_MAX;
++static unsigned long preempt_disable_timeout_ms;
++static int no_tasklock = 1;
++static struct sched_ctrl_us_dev sched_ctrl_us_dev;
++static struct class *sched_ctrl_us_class;
++static struct device *sched_ctrl_us_device;
++
++void tasklock_task_fork(struct task_struct *tsk)
++{
++	unsigned long page;
++
++	if (no_tasklock)
++		return;
++
++	if (__get_tasklock_page(tsk->group_leader) != NULL) {
++		page = __get_free_page(GFP_KERNEL);
++		if (likely(page)) {
++			SetPageReserved(virt_to_page(page));
++			__get_tasklock_page(tsk) = (void *)page;
++			*((unsigned long *)(__get_tasklock_page(tsk))) = 0;
++			*((unsigned long *)(__get_tasklock_locktime(tsk))) = 0;
++			*((unsigned long *)(__get_tasklock_set_tif(tsk))) = 0;
++		}
++	}
++}
++
++void tasklock_task_exit(struct task_struct *tsk)
++{
++	void *page;
++	page = (void *)__get_tasklock_page(tsk);
++	if (page != NULL) {
++		__get_tasklock_page(tsk) = NULL;
++		ClearPageReserved(virt_to_page(page));
++		free_page((uintptr_t)page);
++	}
++}
++
++void tasklock_sched_tick(void)
++{
++	void *page;
++	void *timestamp;
++	void *reset_tif_flag;
++	struct timeval	current_time;
++	unsigned long long now, offset, disable_start;
++	struct pt_regs *regs;
++	struct task_struct *tsk = current;
++
++	if (no_tasklock)
++		return;
++
++	page = __get_tasklock_page(tsk);
++	if (!page)
++		return;
++	timestamp = __get_tasklock_locktime(tsk);
++	reset_tif_flag = __get_tasklock_set_tif(tsk);
++	if ((*(unsigned long long *)page == TASKLOCK_DISABLE)
++			&& (*(unsigned long long *)reset_tif_flag == 1)) {
++		*(unsigned long long *)reset_tif_flag = 0;
++		set_need_resched();
++	}
++
++	if ((*(unsigned long long *)page == TASKLOCK_ENABLE)
++			&& (preempt_disable_timeout_ms)) {
++		disable_start = *(unsigned long long *)timestamp;
++		if (!disable_start)
++			return;
++
++		do_gettimeofday(&current_time);
++		now = (unsigned long long)timeval_to_ns(&current_time);
++		offset = (now - disable_start) >> NS_TO_MS_OFFSET_BITS;
++
++		if (offset >= preempt_disable_timeout_ms) {
++			*(unsigned long long *)timestamp = 0;
++			*(unsigned long long *)page = TASKLOCK_DISABLE;
++			printk(KERN_WARNING "PREEMPT_DISABLE_TIMEOUT comm:%s  pid:%d  tgid:%d\n",
++						tsk->comm, tsk->pid, tsk->tgid);
++			printk(KERN_WARNING "disable_start:%llu now:%llu offset:%llu\n", disable_start, now, offset);
++			regs = task_pt_regs(tsk);
++			show_regs(regs);
++			send_sig(SIGNAL_TASKLOCK_TIMEOUT, tsk, 1);
++		}
++	}
++}
++
++int tasklock_skip_sched(void)
++{
++	unsigned long flags;
++	void *page, *timestamp, *reset_tif_flag;
++	struct timeval current_time;
++	unsigned long long now, offset, disable_start;
++	struct pt_regs *regs;
++	struct task_struct *tsk = current;
++
++	if (no_tasklock)
++		return 0;
++
++	preempt_disable();
++	local_irq_save(flags);
++	page = __get_tasklock_page(tsk);
++	if (!page)
++		goto us_ctrl_need_resched;
++	timestamp = __get_tasklock_locktime(tsk);
++	reset_tif_flag = __get_tasklock_set_tif(tsk);
++	if ((0 == tsk->exit_state)
++		&& (TASK_RUNNING == tsk->state)
++		&& (*((unsigned long long *)page) == TASKLOCK_ENABLE)) {
++		disable_start = *(unsigned long long *)timestamp;
++		if (!disable_start)
++			goto us_ctrl_need_resched;
++		do_gettimeofday(&current_time);
++		now = (unsigned long long)timeval_to_ns(&current_time);
++		offset = (now - disable_start) >> NS_TO_MS_OFFSET_BITS;
++		if ((preempt_disable_timeout_ms != 0) && (offset >= preempt_disable_timeout_ms)) {
++			*(unsigned long long *)timestamp = 0;
++			*((unsigned long long *)page) = TASKLOCK_DISABLE;
++			printk(KERN_WARNING "PREEMPT_DISABLE_TIMEOUT comm:%s  pid:%d  tgid:%d\n",
++					tsk->comm, tsk->pid, tsk->tgid);
++			printk(KERN_WARNING "disable_start:%llu now:%llu offset:%llu\n", disable_start, now, offset);
++			regs = task_pt_regs(tsk);
++			show_regs(regs);
++			send_sig(SIGNAL_TASKLOCK_TIMEOUT, tsk, 1);
++		} else {
++			clear_need_resched();
++			*(unsigned long long *)(reset_tif_flag) = 1;
++			local_irq_restore(flags);
++			preempt_enable_no_resched();
++			return 1;
++		}
++	}
++	*(unsigned long long *)(reset_tif_flag) = 0;
++us_ctrl_need_resched:
++	local_irq_restore(flags);
++	preempt_enable_no_resched();
++	return 0;
++}
++
++void tasklock_update_sched(void)
++{
++	void *page;
++	void *timestamp;
++	struct timeval current_time;
++	unsigned long long now, offset, disable_start;
++	struct pt_regs *regs;
++	struct task_struct *tsk = current;
++
++	if (no_tasklock)
++		return;
++
++	page = __get_tasklock_page(tsk);
++	timestamp = __get_tasklock_locktime(tsk);
++
++	if ((page != NULL)
++		&& (preempt_disable_timeout_ms != 0)
++		&& (0 == tsk->exit_state)
++		&& (TASK_RUNNING == tsk->state)
++		&& (*((unsigned long long *)page) == TASKLOCK_ENABLE)) {
++		disable_start = *(unsigned long long *)timestamp;
++		if (!disable_start)
++			return;
++
++		do_gettimeofday(&current_time);
++		now = (unsigned long long)timeval_to_ns(&current_time);
++		offset = (now - disable_start) >> NS_TO_MS_OFFSET_BITS;
++
++		if (offset >= preempt_disable_timeout_ms) {
++			*(unsigned long long *)timestamp = 0;
++			*((unsigned long long *)page) = TASKLOCK_DISABLE;
++			printk(KERN_WARNING "PREEMPT_DISABLE_TIMEOUT comm:%s  pid:%d  tgid:%d\n",
++					tsk->comm, tsk->pid, tsk->tgid);
++			printk(KERN_WARNING "disable_start:%llu now:%llu offset:%llu\n", disable_start, now, offset);
++			regs = task_pt_regs(tsk);
++			show_regs(regs);
++			send_sig(SIGNAL_TASKLOCK_TIMEOUT, tsk, 1);
++		}
++	}
++}
++
++int sched_ctrl_us_timeout(struct ctl_table *table, int write,
++		void __user *buffer, size_t *lenp, loff_t *ppos)
++{
++	int ret = proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
++
++	if (ret || !write)
++		return ret;
++
++	return 0;
++}
++EXPORT_SYMBOL(sched_ctrl_us_timeout);
++
++/* proc interface of tasklock */
++static ctl_table tasklock_sysctls[] = {
++	{
++		.procname		= "sched_preempt_disable_timeout",
++		.data			= &preempt_disable_timeout_ms,
++		.maxlen			= sizeof(unsigned long),
++		.mode			= 0640,
++		.proc_handler		= sched_ctrl_us_timeout,
++		.extra1			= (unsigned long *)&min_timeout_ms,
++		.extra2			= (unsigned long *)&max_timeout_ms,
++	},
++	{
++		.procname		= "sched_preempt_disable",
++		.data			= &no_tasklock,
++		.maxlen			= sizeof(int),
++		.mode			= 0640,
++		.proc_handler		= proc_dointvec,
++	},
++	{}
++};
++
++/* get /proc/sys/kernel root, /proc/sys/kernel/sched_preempt_disable_timeout */
++static ctl_table sysctls_root[] = {
++	{
++		.procname	= "kernel",
++		.mode		= 0555,
++		.child		= tasklock_sysctls
++	},
++	{}
++};
++
++/* save /proc/sys/kernel root */
++static struct ctl_table_header *sysctls_root_table;
++
++/*
++ * tasklock_proc_init() is the function used to init proc interface
++ *
++ * called by tasklock_dev_init()
++ */
++static int tasklock_proc_init(void)
++{
++	sysctls_root_table = register_sysctl_table(sysctls_root);
++	if (IS_ERR_OR_NULL(sysctls_root_table))
++		return -ENOMEM;
++
++	return 0;
++}
++
++/*
++ * tasklock_proc_exit() is the function used to delete proc interface
++ *
++ * called by tasklock_dev_exit()
++ */
++static void tasklock_proc_exit(void)
++{
++	unregister_sysctl_table(sysctls_root_table);
++	sysctls_root_table = NULL;
++
++	return;
++}
++
++static void vm_open(struct vm_area_struct *vma)
++{
++}
++
++static void vm_close(struct vm_area_struct *vma)
++{
++}
++
++struct vm_operations_struct vm_ops = {
++	.open = vm_open,
++	.close = vm_close,
++};
++
++static int sched_ctrl_us_mmap(struct file *flip, struct vm_area_struct *vma)
++{
++	unsigned long kernel_addr;
++	unsigned long offset;
++	unsigned long physics_addr;
++	unsigned long pfn;
++	unsigned long vmsize;
++	unsigned long psize;
++	struct task_struct *tsk = current;
++	int errno = 0;
++
++	if (no_tasklock) {
++		printk(KERN_WARNING "no memory to map while tasklock disabled.\n");
++		return -EACCES;
++	}
++
++	if (NULL == __get_tasklock_page(tsk)) {
++		kernel_addr = get_zeroed_page(GFP_KERNEL);
++		if (!kernel_addr) {
++			printk(KERN_ERR "lock-task: Allocate memory fail\n");
++			errno = -ENOMEM;
++			goto err;
++		} else {
++			SetPageReserved(virt_to_page(kernel_addr));
++			__get_tasklock_page(tsk) = (void *)kernel_addr;
++		}
++		if (__get_tasklock_page(tsk->group_leader) == NULL) {
++			kernel_addr = __get_free_page(GFP_KERNEL);
++			if (!kernel_addr) {
++				printk(KERN_ERR "lock-task: Allocate memory fail\n");
++				errno = -ENOMEM;
++				goto err;
++			} else {
++				SetPageReserved(virt_to_page(kernel_addr));
++				__get_tasklock_page(tsk->group_leader) = (void *)kernel_addr;
++			}
++		}
++	}
++
++	physics_addr = __pa(__get_tasklock_page(tsk));
++	offset = vma->vm_pgoff << PAGE_SHIFT;
++	pfn = physics_addr >> PAGE_SHIFT;
++	vmsize = vma->vm_end - vma->vm_start;
++	psize = PAGE_SIZE - offset;
++	if (vmsize > psize)
++		return -ENXIO;
++	if (remap_pfn_range(vma, vma->vm_start, pfn, vmsize, vma->vm_page_prot))
++		return -EAGAIN;
++	vma->vm_ops = &vm_ops;
++err:
++	return errno;
++}
++
++const struct file_operations sched_ctrl_us_fops = {
++	.owner = THIS_MODULE,
++	.mmap = sched_ctrl_us_mmap,
++};
++
++static int __init sched_ctrl_us_dev_init(void)
++{
++	int result = 0;
++
++	result = alloc_chrdev_region(&sched_ctrl_us_dev.devno, 0, 1, "sched_ctrl");
++	if (result < 0) {
++		printk(KERN_WARNING "lock-task: can't get major\n");
++		goto err0;
++	}
++
++	printk(KERN_INFO "lock-task: major[%d] minor[%d]\n",
++	MINOR(sched_ctrl_us_dev.devno), MINOR(sched_ctrl_us_dev.devno));
++
++	cdev_init(&sched_ctrl_us_dev.cdev, &sched_ctrl_us_fops);
++	sched_ctrl_us_dev.cdev.owner = THIS_MODULE;
++	sched_ctrl_us_dev.cdev.ops = &sched_ctrl_us_fops;
++	result = cdev_add(&sched_ctrl_us_dev.cdev, sched_ctrl_us_dev.devno, 1);
++	if (result < 0) {
++		printk(KERN_NOTICE "lock-task: Error %d adding sched_ctrl\n", result);
++		goto err1;
++	}
++
++	sched_ctrl_us_class = class_create(THIS_MODULE, "sched_ctrl");
++	if (IS_ERR(sched_ctrl_us_class)) {
++		printk(KERN_WARNING "lock-task: sched_ctrl class create fail\n");
++		goto err1;
++	}
++	sched_ctrl_us_device = device_create(sched_ctrl_us_class, NULL,
++		sched_ctrl_us_dev.devno, NULL, "sched_ctrl");
++	if (IS_ERR(sched_ctrl_us_device)) {
++		printk(KERN_WARNING "lock-task: sched_ctrl device create fail\n");
++		goto err2;
++	}
++	printk(KERN_INFO "lock-task: sched_ctrl created.\n");
++
++	tasklock_proc_init();
++
++	return 0;
++err2:
++	class_destroy(sched_ctrl_us_class);
++err1:
++	unregister_chrdev_region(sched_ctrl_us_dev.devno, 1);
++err0:
++	return result;
++}
++
++late_initcall(sched_ctrl_us_dev_init);
+diff --git a/kernel/timer.c b/kernel/timer.c
+index b7e39516..d6d0e196 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -1209,6 +1209,9 @@ void update_process_times(int user_tick)
+ 	perf_event_do_pending();
+ 	scheduler_tick();
+ 	run_posix_cpu_timers(p);
++#ifdef CONFIG_RTOS_TASKLOCK
++	tasklock_sched_tick();
++#endif
+ }
+ 
+ /*
+-- 
+2.12.3
+
