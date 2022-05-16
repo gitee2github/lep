@@ -1,0 +1,3803 @@
+Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 and
+only version 2 as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+---
+ arch/arm/kernel/traps.c         |   18 +-
+ arch/arm/mm/fault.c             |   30 +-
+ include/linux/kbox/kbox.h       |  279 +++++++++
+ include/linux/sched.h           |    3 +
+ include/linux/set_kbox_region.h |   38 ++
+ kernel/Makefile                 |    2 +
+ kernel/fork.c                   |    7 +-
+ kernel/kbox/Makefile            |    2 +
+ kernel/kbox/ddrramdriver.c      |  174 ++++++
+ kernel/kbox/kbox_core.c         | 1185 +++++++++++++++++++++++++++++++++++++++
+ kernel/kbox/kbox_core.h         |  202 +++++++
+ kernel/kbox/kbox_dev.c          |  186 ++++++
+ kernel/kbox/kbox_dev.h          |    8 +
+ kernel/kbox/kbox_include.h      |  133 +++++
+ kernel/kbox/kbox_logbuf.c       |  308 ++++++++++
+ kernel/kbox/kbox_main.c         |   69 +++
+ kernel/kbox/kbox_main.h         |   47 ++
+ kernel/kbox/kbox_proc.c         |  547 ++++++++++++++++++
+ kernel/kbox/kbox_proc.h         |   27 +
+ kernel/printk.c                 |   40 +-
+ kernel/sched.c                  |    7 +
+ kernel/set_kbox_region.c        |  160 ++++++
+ lib/Kconfig.debug               |   14 +
+ 23 files changed, 3479 insertions(+), 7 deletions(-)
+ create mode 100644 include/linux/kbox/kbox.h
+ create mode 100644 include/linux/set_kbox_region.h
+ create mode 100644 kernel/kbox/Makefile
+ create mode 100644 kernel/kbox/ddrramdriver.c
+ create mode 100644 kernel/kbox/kbox_core.c
+ create mode 100644 kernel/kbox/kbox_core.h
+ create mode 100644 kernel/kbox/kbox_dev.c
+ create mode 100644 kernel/kbox/kbox_dev.h
+ create mode 100644 kernel/kbox/kbox_include.h
+ create mode 100644 kernel/kbox/kbox_logbuf.c
+ create mode 100644 kernel/kbox/kbox_main.c
+ create mode 100644 kernel/kbox/kbox_main.h
+ create mode 100644 kernel/kbox/kbox_proc.c
+ create mode 100644 kernel/kbox/kbox_proc.h
+ create mode 100644 kernel/set_kbox_region.c
+
+diff --git a/arch/arm/kernel/traps.c b/arch/arm/kernel/traps.c
+index 1621e532..b75bc1bc 100644
+--- a/arch/arm/kernel/traps.c
++++ b/arch/arm/kernel/traps.c
+@@ -31,6 +31,10 @@
+ #include <asm/traps.h>
+ #include <asm/unwind.h>
+ 
++#ifdef CONFIG_KBOX
++#include <linux/set_kbox_region.h>
++#endif
++
+ #include "ptrace.h"
+ #include "signal.h"
+ 
+@@ -345,7 +349,10 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ 	unsigned int instr;
+ 	siginfo_t info;
+ 	void __user *pc;
+-
++#ifdef CONFIG_KBOX
++	int r;
++	r = set_kbox_region(KBOX_DEFAULT_REG_ID);
++#endif
+ 	/*
+ 	 * According to the ARM ARM, PC is 2 or 4 bytes ahead,
+ 	 * depending whether we're in Thumb mode or not.
+@@ -363,8 +370,12 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ 		get_user(instr, (u32 __user *)pc);
+ 	}
+ 
+-	if (call_undef_hook(regs, instr) == 0)
++	if (call_undef_hook(regs, instr) == 0) {
++#ifdef CONFIG_KBOX
++		restore_kbox_region(r);
++#endif
+ 		return;
++	}
+ 
+ #ifdef CONFIG_DEBUG_USER
+ 	if (user_debug & UDBG_UNDEFINED) {
+@@ -380,6 +391,9 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ 	info.si_addr  = pc;
+ 
+ 	arm_notify_die("Oops - undefined instruction", regs, &info, 0, 6);
++#ifdef CONFIG_KBOX
++	restore_kbox_region(r);
++#endif
+ }
+ 
+ asmlinkage void do_unexp_fiq (struct pt_regs *regs)
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index 8ad75e99..05092da1 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -24,6 +24,10 @@
+ #include <asm/pgtable.h>
+ #include <asm/tlbflush.h>
+ 
++#ifdef CONFIG_KBOX
++#include <linux/set_kbox_region.h>
++#endif
++
+ #include "fault.h"
+ 
+ /*
+@@ -520,9 +524,17 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ {
+ 	const struct fsr_info *inf = fsr_info + fsr_fs(fsr);
+ 	struct siginfo info;
++#ifdef CONFIG_KBOX
++	int r;
++	r = set_kbox_region(KBOX_DEFAULT_REG_ID);
++#endif
+ 
+-	if (!inf->fn(addr, fsr & ~FSR_LNX_PF, regs))
++	if (!inf->fn(addr, fsr & ~FSR_LNX_PF, regs)) {
++#ifdef CONFIG_KBOX
++		restore_kbox_region(r);
++#endif
+ 		return;
++	}
+ 
+ 	printk(KERN_ALERT "Unhandled fault: %s (0x%03x) at 0x%08lx\n",
+ 		inf->name, fsr, addr);
+@@ -532,6 +544,9 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	info.si_code  = inf->code;
+ 	info.si_addr  = (void __user *)addr;
+ 	arm_notify_die("", regs, &info, fsr, 0);
++#ifdef CONFIG_KBOX
++	restore_kbox_region(r);
++#endif
+ }
+ 
+ 
+@@ -575,9 +590,17 @@ do_PrefetchAbort(unsigned long addr, unsigned int ifsr, struct pt_regs *regs)
+ {
+ 	const struct fsr_info *inf = ifsr_info + fsr_fs(ifsr);
+ 	struct siginfo info;
++#ifdef CONFIG_KBOX
++	int r;
++	r = set_kbox_region(KBOX_DEFAULT_REG_ID);
++#endif
+ 
+-	if (!inf->fn(addr, ifsr | FSR_LNX_PF, regs))
++	if (!inf->fn(addr, ifsr | FSR_LNX_PF, regs)) {
++#ifdef CONFIG_KBOX
++		restore_kbox_region(r);
++#endif
+ 		return;
++	}
+ 
+ 	printk(KERN_ALERT "Unhandled prefetch abort: %s (0x%03x) at 0x%08lx\n",
+ 		inf->name, ifsr, addr);
+@@ -587,5 +610,8 @@ do_PrefetchAbort(unsigned long addr, unsigned int ifsr, struct pt_regs *regs)
+ 	info.si_code  = inf->code;
+ 	info.si_addr  = (void __user *)addr;
+ 	arm_notify_die("", regs, &info, ifsr, 0);
++#ifdef CONFIG_KBOX
++	restore_kbox_region(r);
++#endif
+ }
+ 
+diff --git a/include/linux/kbox/kbox.h b/include/linux/kbox/kbox.h
+new file mode 100644
+index 00000000..bce27f6c
+--- /dev/null
++++ b/include/linux/kbox/kbox.h
+@@ -0,0 +1,279 @@
++
++#ifndef __KBOX_H__
++#define __KBOX_H__
++
++#ifdef __KERNEL__
++#include <asm/types.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>	/* error codes */
++#include <linux/types.h>	/* size_t */
++#include <linux/rtc.h>
++
++#define KBOX_DBG_PRINTK printk
++#endif
++
++
++#define KBOX_DEBUG_TRACE_CONFIG 0
++#if KBOX_DEBUG_TRACE_CONFIG
++#define KBOX_DEBUG_TRACE() KBOX_DBG_PRINTK("\n*******%s %d\n", __FILE__,__LINE__)
++#else
++#define KBOX_DEBUG_TRACE() 
++#endif
++
++
++#ifndef __KERNEL__
++typedef signed char s8;
++typedef unsigned char u8;
++
++typedef signed short s16;
++typedef unsigned short u16;
++
++typedef signed int s32;
++typedef unsigned int u32;
++typedef unsigned long long u64;
++#endif
++
++//type to hold 32/64bit address
++typedef unsigned long long addr64_t;
++
++/*
++
++	kbox dev status:
++				|-----------------------|
++				V						|
++		not format<---> fs ok<------>fs_error
++				A		  A	         A
++				|		  |			 |	
++				|		  |	 		 |
++				|		  V			 |
++				|--->  fault <--------
++
++
++	kbox status:
++
++			maintain<------>working
++*/
++#define KBOX_DEV_STATUS_NOT_FORMAT	(0)
++#define KBOX_DEV_STATUS_FS_ERROR        (1)
++#define KBOX_DEV_STATUS_FS_OK           (2)
++#define KBOX_DEV_STATUS_FAULT		(3)
++
++
++#define KBOX_REGION_INDEX_ANY				(0xff)
++#define KBOX_REGION_PRIO_DEFAULT			(100)
++
++/*
++kbox file system definition 
++*******************************************************************************
++*/
++/*device name max length*/
++#define KBOX_DEV_NAME_MAXLEN 	(32)
++#define KBOX_REGION_NAME_LEN	(32)
++#define KBOX_DEFAULT_REG_ID (0)
++
++struct kbox_region
++{
++	char name[KBOX_REGION_NAME_LEN];
++	size_t size;
++	struct module *mod;
++	int rfd;
++};
++
++/*Ioctl definitions*/
++/* Use 'k' as magic number */
++#define KBOX_IOC_MAGIC  'k'
++/*create region*/
++#define KBOX_IOC_CREATE_REGION			_IOWR(KBOX_IOC_MAGIC, 1,  char)
++
++
++/*only for kbox kernel modules*/
++#ifdef __KERNEL__
++
++#define SYNC_ALL -1
++
++extern void kbox_sync(int rfd);
++
++/*
++kbox logbuf lib
++*******************************************************************************
++*/
++#define KBOX_LOG_BUF_CB_MAGIC (0xABC78DEF)
++
++extern asmlinkage int kbox_write(int fd, const char * buff,unsigned len);
++
++#ifdef KBOX_SUPPORT_LOCKDEP
++#define KBOX_PRINTK_LOCK(LOCK, FLAGS) \
++	do {raw_local_irq_save(FLAGS);\
++	lockdep_off();\
++	spin_lock_irq(LOCK);}while(0)
++
++#define KBOX_PRINTK_UNLOCK(LOCK, FLAGS) \
++	do {spin_unlock(LOCK);\
++	lockdep_on();\
++	raw_local_irq_restore(FLAGS);}while(0)
++	
++#else
++
++#define KBOX_PRINTK_LOCK(LOCK, FLAGS) spin_lock_irqsave(LOCK, FLAGS)
++
++#define KBOX_PRINTK_UNLOCK(LOCK, FLAGS) spin_unlock_irqrestore(LOCK, FLAGS)
++
++#endif
++
++/*
++kbox region register/unregister
++*******************************************************************************
++*/
++
++extern int kbox_create_region(struct kbox_region *reg_interface);
++
++#define kbox_register_region(_reg) \
++	({\
++		_reg.mod = THIS_MODULE;\
++		kbox_create_region(&_reg);\
++	})
++
++#define kbox_unregister_region(_reg) \
++	({\
++	})
++
++/*
++kbox device driver register/unregister
++*******************************************************************************
++*/
++#define DDR_RAM_DEV_NAME    "ddrram"
++#define DDR_RAM_DEVICE_PRIO  100
++
++/*device mode macros*/
++#define	KBOX_DEV_MODE_CACHE 	(1) 
++#define	KBOX_DEV_MODE_MAP 		(2)
++#define	KBOX_DEV_MODE_REDIRECT	(3)
++/*These modes are currently not supported completely in this version*/
++#define KBOX_DEV_MODE_FLASH		(4)
++#define KBOX_DEV_MODE_BLOCK		(5)
++#define KBOX_DEV_MODE_RAM		(6)
++
++/*
++Control Block of an kbox device
++*/
++struct kbox_dev_des
++{
++	char	device_name[KBOX_DEV_NAME_MAXLEN];
++	u32 	size;
++	u32 	mode;
++	u32 	vm_flag;
++	struct module *module;
++
++	union{
++		struct{/*only for devices in map mode*/
++			char	*mapped_addr;
++			int		mapped_size;
++			unsigned long phy;
++		}map_op;
++		
++		/*only for devices in cache mode*/
++		struct{
++			size_t	(*read)(struct kbox_dev_des *, char *, size_t, 
++									loff_t );
++			size_t	(*write)(struct kbox_dev_des *, char *, size_t, 
++									loff_t );
++		}cache_op;
++		
++		struct{/*only for devices in redirect mode*/
++			size_t	(*read)(struct kbox_dev_des *, char *, size_t, 
++									loff_t );
++			/*\fn write_file_desc
++			\param	struct kbox_dev_des  
++			\param	int		fd of the region.
++			\param	char*	name of region
++			\param	size_t	size of region.
++			\return	int		<0:error. else 0K.
++			*/
++			int		(*write_file_desc)(struct kbox_dev_des *, int ,char* , 
++									size_t);
++			/*\fn write_file_data
++			\param	struct kbox_dev_des  
++			\param	int		fd of the region.
++			\param	char*	data buffer for writing.
++			\param	size_t	size of buffer
++			\param	loff_t	file offset.
++			\return	int		<0:error. else the len of data written.
++			*/			
++			size_t	(*write_file_data)(struct kbox_dev_des *, int , 
++									char *, size_t, loff_t);
++
++			/*\fn write_file_data
++			\param	struct kbox_dev_des  
++			\param	int		fd of the region.
++			\return	int		<0:error. else 0K.
++			*/			
++			int 	(*close)(struct kbox_dev_des *, int );	
++
++			/*\fn dump_start
++			\param	struct kbox_dev_des  
++			
++			notify driver begin to dump some data.
++			*/
++			void	(*dump_begin)(struct kbox_dev_des *);
++
++			/*\fn dump_end
++			\param	struct kbox_dev_des  
++			
++			notify driver end of dumping some data.
++			*/
++			void	(*dump_end)(struct kbox_dev_des *);
++			
++		}redirect_op;
++	}op;
++
++#define op_mapped_addr 	op.map_op.mapped_addr
++#define op_mapped_size  op.map_op.mapped_size
++#define op_mapped_phy  op.map_op.phy
++#define op_read			op.cache_op.read
++#define op_write		op.cache_op.write
++#define op_rread		op.redirect_op.read
++#define op_write_file_desc op.redirect_op.write_file_desc
++#define op_write_file_data op.redirect_op.write_file_data
++#define op_close        op.redirect_op.close		
++#define op_begin        op.redirect_op.dump_begin	
++#define op_end        op.redirect_op.dump_end	
++
++
++	ssize_t (*show)(char *, size_t);  /*print some device info */
++
++	void *private;
++} ;
++
++struct kbox_iter{
++	void *start_read;
++	void *buff;
++	size_t len;
++	unsigned int read_len;
++	unsigned int total;
++	void* arg;
++	int locked;
++};
++
++extern int kbox_visit_start(int region_id, struct kbox_iter *cur);
++extern int kbox_visit_next(struct kbox_iter *cur);
++extern void kbox_visit_stop(struct kbox_iter *cur);
++extern int kbox_iter_read(struct kbox_iter *cur, int (*reader)(const char *buf, size_t len, void *arg), void *arg);
++
++extern int kbox_register_device(struct kbox_dev_des *dev_desc);
++
++extern int kbox_unregister_device(char *name);
++
++
++#ifdef KBOX_STATIC_MAJOR_NO
++	#define KBOX_DEV_MAJOR_NO  250
++#else
++	#define KBOX_DEV_MAJOR_NO  (0)
++#endif
++
++#endif
++
++#endif
++
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index c66e0af1..e71e3d95 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1507,6 +1507,9 @@ struct task_struct {
+ 		unsigned long memsw_bytes; /* uncharged mem+swap usage */
+ 	} memcg_batch;
+ #endif
++#ifdef CONFIG_KBOX
++	atomic_t kbox_region_conf; /* config printk output to which kbox region */
++#endif
+ };
+ 
+ /* Future-safe accessor for struct task_struct's cpus_allowed. */
+diff --git a/include/linux/set_kbox_region.h b/include/linux/set_kbox_region.h
+new file mode 100644
+index 00000000..d1bed42b
+--- /dev/null
++++ b/include/linux/set_kbox_region.h
+@@ -0,0 +1,38 @@
++#ifndef __SET_KBOX_REGION_H
++#define __SET_KBOX_REGION_H
++#include <linux/kbox/kbox.h>
++#define REGIONID_BITS 16
++#define CONTEXT_BITS 26
++#define REGIONID_MASK ((1 << REGIONID_BITS) - 1)
++#define CONTEXT_LEVEL_MASK (~REGIONID_MASK)
++#define CONTEXT_MASK (~((1 << CONTEXT_BITS) - 1))
++
++#define PROCESS_CONTEXT (1 << CONTEXT_BITS)
++#define SOFTIRQ_CONTEXT (2 << CONTEXT_BITS)
++#define HARDIRQ_CONTEXT (3 << CONTEXT_BITS)
++
++#define KBOX_CONF_PANIC (PROCESS_CONTEXT | KBOX_DEFAULT_REG_ID)
++
++typedef int (*kbox_create_region_func_t)(struct kbox_region *reg_interface);
++typedef int (*kbox_write_func_t)(int fd, const char *buf, unsigned len);
++
++
++#ifdef CONFIG_KBOX
++extern void init_kbox_region(struct task_struct *p);
++extern int __attribute__((warn_unused_result)) set_kbox_region(int mod_region);
++extern void restore_kbox_region(int old_setting);
++extern int get_kbox_region(void);
++extern void register_kbox_callback(kbox_create_region_func_t create_func, kbox_write_func_t write_func);
++extern int kern_kbox_register_region(const char *name, size_t size, struct module *mod);
++extern int kern_kbox_write(int fd, const char *buf, unsigned len);
++#else
++static inline void init_kbox_region(struct task_struct *p) {return;}
++static inline int __attribute__((warn_unused_result)) set_kbox_region(int mod_region) {return 0;}
++static inline void restore_kbox_region(int old_setting) {return;}
++static inline int get_kbox_region(void) {return KBOX_DEFAULT_REG_ID;}
++static inline void register_kbox_callback(kbox_create_region_func_t create_func, kbox_write_func_t write_func){return ;}
++static inline int kern_kbox_register_region(const char *name, size_t size, struct module *mod){return -EINVAL;}
++static inline int kern_kbox_write(int fd, const char *buf, unsigned len){return -EINVAL;}
++#endif
++
++#endif
+diff --git a/kernel/Makefile b/kernel/Makefile
+index a987aa16..002faf0a 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -105,6 +105,8 @@ obj-$(CONFIG_PERF_EVENTS) += perf_event.o
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT) += hw_breakpoint.o
+ obj-$(CONFIG_USER_RETURN_NOTIFIER) += user-return-notifier.o
+ obj-$(CONFIG_PADATA) += padata.o
++obj-$(CONFIG_KBOX) += set_kbox_region.o
++obj-$(CONFIG_KBOX) += kbox/
+ 
+ ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTER),y)
+ # According to Alan Modra <alan@linuxcare.com.au>, the -fno-omit-frame-pointer is
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 32fdbd46..395143a2 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -74,6 +74,9 @@
+ #include <asm/tlbflush.h>
+ 
+ #include <trace/events/sched.h>
++#ifdef CONFIG_KBOX
++#include <linux/set_kbox_region.h>
++#endif
+ 
+ /*
+  * Protected counters by write_lock_irq(&tasklist_lock)
+@@ -1275,7 +1278,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 		attach_pid(p, PIDTYPE_PID, pid);
+ 		nr_threads++;
+ 	}
+-
++#ifdef CONFIG_KBOX
++	init_kbox_region(p);
++#endif
+ 	total_forks++;
+ 	spin_unlock(&current->sighand->siglock);
+ 	write_unlock_irq(&tasklist_lock);
+diff --git a/kernel/kbox/Makefile b/kernel/kbox/Makefile
+new file mode 100644
+index 00000000..258da370
+--- /dev/null
++++ b/kernel/kbox/Makefile
+@@ -0,0 +1,2 @@
++obj-y := kbox.o
++kbox-y := kbox_main.o kbox_core.o kbox_proc.o kbox_logbuf.o kbox_dev.o ddrramdriver.o
+diff --git a/kernel/kbox/ddrramdriver.c b/kernel/kbox/ddrramdriver.c
+new file mode 100644
+index 00000000..07c8e91e
+--- /dev/null
++++ b/kernel/kbox/ddrramdriver.c
+@@ -0,0 +1,174 @@
++#include <linux/mm.h>
++#include <linux/kbox/kbox.h>
++#include <asm/io.h>
++//DDR Ram device name
++phys_addr_t   ddr_ram_address = 0;
++phys_addr_t  ddr_ram_size = 0 ;
++char *ddr_mmap_addr = NULL;
++
++struct kbox_dev_des stDDRRamDevice;
++
++static int __init kbox_mem_setup(char *str)
++{
++	char *endp = NULL;
++	ddr_ram_size  = memparse(str, &endp);
++	if (*endp == '@')
++		ddr_ram_address = memparse(endp + 1, NULL);
++	
++	return 0;
++}
++
++__setup("kbox_mem=", kbox_mem_setup);
++
++/*****************************************************************************
++ Function name: ddr_ram_show
++ Description  : show info about kbox ram device
++ Input        :
++ 			input1	buf	the buffer for outputing show info 
++			input2	len	the size of buf			 				
++ 			
++ Output       : None
++ Return Value : The length of data in buf(int).
++ Calls        : 
++ Called By    : 
++
++*****************************************************************************/
++
++static ssize_t ddr_ram_show(char *buf, size_t len)
++{
++	int ret = 0;
++	
++	if (NULL == buf)
++	{
++	    return ret;
++	}		
++
++	ret += snprintf(buf, (len - ret), "This is DDR RAM driver\n");
++
++	return ret;
++}
++
++
++
++
++/*****************************************************************************
++ Function name: ddr_ram_dev_desc_init
++ Description  : show info about kbox ram device
++ Input        : None
++		 				
++ 			
++ Output       : It will intialize struct kbox_dev_des data structure
++ Return Value : void
++ Calls        : 
++ Called By    : 
++
++*****************************************************************************/
++
++
++
++int ddr_ram_dev_desc_init(void)
++{
++	
++	struct kbox_dev_des *cb = &stDDRRamDevice;
++	int iret = 0;
++	memset(cb, 0 ,sizeof(*cb));
++
++	/*map ddr dev phy to virtual*/
++        ddr_mmap_addr = ioremap(ddr_ram_address, ddr_ram_size);
++	  
++	if (NULL == ddr_mmap_addr)
++	{
++		KBOX_DEBUG_TRACE();
++		printk(KERN_NOTICE "mapp kbox ddrram_address=%llx, \
++			ddrram_size=%llx fail", (unsigned long long)ddr_ram_address, (unsigned long long)ddr_ram_size);
++		iret = -EADDRNOTAVAIL;
++		return iret;
++	}
++       
++
++
++	strncpy(cb->device_name, DDR_RAM_DEV_NAME, KBOX_DEV_NAME_MAXLEN);
++	
++	cb->mode = KBOX_DEV_MODE_MAP;
++	cb->module = THIS_MODULE;
++	cb->show = ddr_ram_show;
++	
++	
++	/* Currently the adddress and Size  have been passed by module parameter.Once we will get customer interface to get the 
++	 ram address and size we can use that interface function */
++	cb->op_mapped_phy = ddr_ram_address;
++	cb->size = ddr_ram_size;
++	cb->op_mapped_addr = ddr_mmap_addr;
++	//This flag is to enable memory IO
++	cb->vm_flag = VM_IO;
++	
++	return iret;
++	
++}
++
++
++
++/*****************************************************************************
++ Function name : ddr_ram_init
++ Description  : Intialize the module and call the function ddr_ram_dev_desc_init
++ Input        : void
++		 				
++ 			
++ Output       : None
++ Return Value : 
++ Calls        : 
++ Called By    : This will be called by kernel when we insert the module in the kernel
++
++*****************************************************************************/
++int __init ddr_ram_init(void)
++{
++	int iret ;
++
++	//Intialize the descriptor struct kbox_dev_des with driver information for registration.
++	iret = ddr_ram_dev_desc_init();
++
++	if( 0 > iret )
++	{
++	    printk(KERN_NOTICE "[WARNNING]:Kbox device descriptor struct kbox_dev_des \
++		Intialization Failed\n");
++	    return iret;		
++	}
++
++	
++	/*register to kbox core*/
++	iret = kbox_register_device(&stDDRRamDevice);
++	
++	if( 0 > iret )
++	{
++		iounmap(ddr_mmap_addr);
++		stDDRRamDevice.op_mapped_addr = NULL;
++		printk (KERN_NOTICE "[ERROR]:DDR Ram Driver Registeration to Kbox Failed\n");
++	}
++	return iret;
++}
++
++/*****************************************************************************
++ Function name: ddr_ram_exit
++ Description  : Unintialize the module and call the function kbox_unregister_device
++ Input        : void
++
++ Output       : None
++ Return Value :void
++ Calls        : 
++ Called By    : This will be called by kernel when we remove module from the kernel
++
++*****************************************************************************/
++void ddr_ram_exit(void)
++{
++	int iret;
++	
++	iret = kbox_unregister_device(stDDRRamDevice.device_name);
++	if( 0 > iret )
++	{
++        	printk (KERN_NOTICE "[ERROR]:DDR Ram Driver Unregisteration from Kbox Failed");
++    	}
++	if ( NULL != ddr_mmap_addr){
++		iounmap(ddr_mmap_addr);
++	}
++
++}
+diff --git a/kernel/kbox/kbox_core.c b/kernel/kbox/kbox_core.c
+new file mode 100644
+index 00000000..9e549833
+--- /dev/null
++++ b/kernel/kbox/kbox_core.c
+@@ -0,0 +1,1185 @@
++#include "kbox_include.h"
++
++KBOX_MEMORY	kbox_memory_list;
++KBOX_DEV_CB	kbox_dev_cb;
++KBOX_REGION_CB *kbox_default_region;
++
++static void 		*dump_start = NULL;
++static size_t 		dump_len = 0;
++
++char warnstr_dump[KBOX_WARNNING_LEN];
++
++struct list_head 	kbox_region_list;
++
++atomic_t		kbox_in_sync;
++
++atomic_t 		dump_flag;
++
++/*Not supporting concurent process for kbox, only one task can enter into the 
++kbox code area. We don't care of speed when doing most of the kbox operation.
++
++*/ 
++struct semaphore	kbox_sem;
++
++static short kbox_region_fd = 0;
++
++struct module *kbox_module;
++
++static char *dump_path = NULL;
++module_param(dump_path, charp, S_IRUGO | S_IWUSR);
++
++static unsigned int kbox_default_reg_size= KBOX_DEFAULT_REG_SIZE;
++module_param(kbox_default_reg_size, uint, S_IRUGO | S_IWUSR);
++
++int kbox_show_dev_cb(char *buf, int len);
++
++KBOX_REGION_DESC *kbox_region_desc_find(char *name);
++int kbox_region_get_size(KBOX_REGION_CB *cb);
++
++#define KBOX_EXCEPTION_LOG_NAME	"panic.txt"
++#define KBOX_EXCEPTION_LOG_NAME_LEN 128
++
++struct task_struct *kbox_daemon;
++
++/*dump memory before clear it*/
++int kbox_exception_dump(void *viraddr, size_t length, char *warnstr)
++{
++	struct file* fp = NULL;
++	mm_segment_t fs;
++	loff_t pos = 0;
++	size_t warn_len;
++	char *temp = NULL;
++	char full_dump_path[KBOX_EXCEPTION_LOG_NAME_LEN];
++
++	if(NULL == dump_path){
++		printk("kbox_exception_dump abort for NULL dump_path!\n");
++		return -EINVAL;
++	}
++	
++	if(NULL == viraddr){
++		printk("kbox_exception_dump abort for NULL viraddr!\n");
++		return -EINVAL;
++	}
++	
++	temp = dump_path + strlen(dump_path) - 1;
++	if(*temp == '\n')
++		*temp = '\0';
++
++	if((strlen(dump_path) + strlen(KBOX_EXCEPTION_LOG_NAME) + 2) > KBOX_EXCEPTION_LOG_NAME_LEN)
++	{
++		printk("kbox_exception_dump abort for dump_path's length is too long!\n");
++		return -EINVAL;
++	}	
++	snprintf(full_dump_path,KBOX_EXCEPTION_LOG_NAME_LEN,"%s/%s",dump_path,KBOX_EXCEPTION_LOG_NAME);
++	 
++	fp = filp_open(full_dump_path, O_CREAT | O_RDWR, 0640);
++	if(IS_ERR(fp)){
++		/*we can not remind it fails for we well do dump in kbox_write*/
++		return PTR_ERR(fp);
++	}
++
++	fs = get_fs();
++	set_fs((mm_segment_t)get_ds());
++	if(NULL != warnstr){
++		warn_len = strlen(warnstr);
++		if(warn_len > 0)
++			vfs_write(fp, warnstr,warn_len, &pos);
++	}
++	vfs_write(fp, viraddr,length, &pos);
++	set_fs(fs);
++	filp_close(fp, NULL);
++	return 0;
++	 
++}
++
++
++/*
++ * The watchdog thread - runs every second and touches the timestamp.
++ */
++static int kbox_coredump(void *data)
++{
++	set_current_state(TASK_INTERRUPTIBLE);
++	while (!kthread_should_stop()) {
++
++		if(dump_start !=NULL && dump_len > 0){
++			(void)kbox_exception_dump(dump_start, dump_len, warnstr_dump);
++			atomic_dec(&dump_flag);
++		}
++
++		set_current_state(TASK_INTERRUPTIBLE);
++		
++		schedule();
++
++		if (kthread_should_stop())
++			break;
++	}
++	__set_current_state(TASK_RUNNING);
++
++	return 0;
++}
++
++
++int wakeup_kboxd(void *start, unsigned long len, char *warnstr)
++{
++	/*kbox daemon is not created*/
++	if (kbox_daemon == NULL || dump_start == NULL) 
++		return -EINVAL;
++
++	/*right now we are on dumping*/
++	if(atomic_inc_return(&dump_flag) > 1){
++		atomic_dec(&dump_flag);
++		return -EAGAIN;
++	}
++
++	if(len + KBOX_WARNNING_LEN > dump_len)
++		len = dump_len - KBOX_WARNNING_LEN;
++
++	memcpy(dump_start, start, len);
++
++	if( warnstr != NULL){
++		warnstr_dump[KBOX_WARNNING_LEN - 1] = '\0';
++		strncpy(warnstr_dump, warnstr, KBOX_WARNNING_LEN - 1);
++	}
++	wake_up_process(kbox_daemon);
++	
++	return 0;
++}
++
++
++/*
++generate an checksum for an buffer.
++\param	buff	pointer to an buffer for checksum.
++\param	size	the buffer length. 
++
++algo:
++	convert the buffer into an char array.
++	add all chars together.
++*/
++static u32 kbox_checksum(u8* buff, int size)
++{
++	u32 cksum = 0;
++
++	if (!buff || size < 0){
++		return 0;
++	}
++	
++	while(size--){
++		cksum += *buff++;
++	}
++	return cksum;
++}
++
++void update_checksum(void)
++{
++	u32 checksum;
++	
++	checksum = kbox_checksum((u8*)kbox_memory_list.region_table, 
++						kbox_memory_list.region_table_len);
++	kbox_memory_list.fs_head->file_desc_table_checksum = cpu_to_be32(checksum);
++
++	kbox_memory_list.fs_head->basic.checksum = 0;
++	checksum = kbox_checksum((u8*)kbox_memory_list.fs_head, 
++							sizeof(*(kbox_memory_list.fs_head)));
++	kbox_memory_list.fs_head->basic.checksum = cpu_to_be32(checksum);
++}
++
++
++/*
++sync all cached data of kbox to kbox device. 
++
++should call this function in following condition:
++(1)system panic
++(2)system reboot
++(3)kbox unload ?
++*/
++void kbox_sync(int rfd)
++{
++}
++EXPORT_SYMBOL(kbox_sync);
++
++
++/*
++malloc an region cb and do basic initialization.
++
++	malloc an region cb
++	init basic fields
++	register proc entry for that region.
++*/
++static KBOX_REGION_CB *kbox_region_malloc(char *name, int size, KBOX_REGION_DESC* log_des,
++	struct module* module)
++{
++	KBOX_REGION_CB *cb = NULL;
++	/*alloc and init an region cb.*/
++	
++	cb = kmalloc(sizeof(*cb), GFP_KERNEL);
++	if (!cb){
++		goto out;
++	}
++	memset(cb, 0, sizeof(*cb));
++	snprintf(cb->name, KBOX_REGION_NAME_LEN, "%s", name);
++
++	spin_lock_init(&cb->logbuf_lock);
++	cb->magic = KBOX_LOG_BUF_CB_MAGIC;
++
++	if( log_des->offset < PAGE_SIZE )
++	{
++		printk("log_des.offset:%u < PAGE_SIZE", log_des->offset);
++		log_des->offset = PAGE_SIZE + kbox_default_reg_size;
++	}
++	cb->fd = kbox_region_fd++;
++	cb->size = log_des->size;
++	cb->log_buf = log_des->offset + kbox_memory_list.memory_head;
++	cb->part_copy = 0;
++	cb->pregion_des = log_des;
++	cb->is_reading = 0;
++	cb->module	= module;
++	if( module != NULL )
++		snprintf(cb->module_name, KBOX_MODULE_NAME_LEN, "%s", module->name);
++	else
++		memset(cb->module_name, 0, KBOX_MODULE_NAME_LEN);
++
++	cb->proc_entry = 
++		create_proc_entry(cb->name, 0644, kbox_proc_regions);
++	if( NULL == cb->proc_entry ){
++		printk("Proc entry creation for Region %s failed\n",cb->name);
++		kfree(cb);
++		return NULL;
++	}
++	cb->proc_entry->proc_fops = &kbox_proc_file_operations;
++	cb->proc_entry->size = cb->size;
++	cb->proc_entry->data = cb;
++
++	if(module != THIS_MODULE && !try_module_get(kbox_dev_cb.dev_desc->module))
++	{
++		printk("get module fail\n");
++		remove_proc_entry(cb->name, kbox_proc_regions);
++		kfree(cb);
++		cb = NULL;
++		goto out;
++	}
++
++	/*if we do not dump*/
++	if (kbox_daemon == NULL)
++		goto out;
++
++	if(cb->size + KBOX_WARNNING_LEN > dump_len){
++		if(dump_start != NULL)
++			vfree(dump_start);
++		dump_start = vmalloc(cb->size+KBOX_WARNNING_LEN);
++		if(dump_start == NULL){
++			printk(KERN_INFO "malloc dump memory fail, we will not dump when kbox self error\n");
++			dump_len = 0;
++		}else{
++			dump_len = cb->size + KBOX_WARNNING_LEN ;
++		}
++	}
++
++
++out:
++	return cb;
++
++}
++
++/*
++free an region cb
++
++	unreg proc entry of that region
++	free region cb.
++
++   no need to protect proc delete for filesystem will protect file would not delete when open it
++   and before free region control block, we must delete region proc file first. so wen read region, control block
++   wouldn't be null
++*/
++static void kbox_region_free(KBOX_REGION_CB *cb)
++{
++	if(cb->module != THIS_MODULE)
++		module_put(kbox_dev_cb.dev_desc->module);
++
++	remove_proc_entry(cb->name, kbox_proc_regions);
++	kfree(cb);
++}
++
++
++
++/*
++find an region from region list.
++\param	name  name of region.
++\return 		NULL:can not find that region; 
++				Not NULL:pointer to the found region cb
++*/
++KBOX_REGION_CB * kbox_region_find_by_name(char *name)
++{
++	struct list_head *ptr = NULL;
++	KBOX_REGION_CB *entry = NULL;
++	KBOX_REGION_CB *cb_found = NULL;
++	list_for_each(ptr, &kbox_region_list){
++		entry = list_entry(ptr, KBOX_REGION_CB, list);
++		if (!strncmp(entry->name, name, KBOX_REGION_NAME_LEN)){
++			cb_found = entry;
++			break;
++		}
++	}
++	return cb_found;
++}
++
++
++/*
++find an region from region list.
++\param	name  name of region.
++\return 		NULL:can not find that region; 
++				Not NULL:pointer to the found region cb
++
++*/
++KBOX_REGION_CB * kbox_region_find(int rfd)
++{
++	struct list_head *ptr = NULL;
++	KBOX_REGION_CB *entry = NULL;
++	KBOX_REGION_CB *cb_found = NULL;
++	list_for_each(ptr, &kbox_region_list){
++		entry = list_entry(ptr, KBOX_REGION_CB, list);
++		if (entry->fd == rfd){
++			cb_found = entry;
++			break;
++		}
++	}
++	return cb_found;
++}
++
++/*
++add an region into region  list.
++\param	cb	the pointer to KBOX_REGION_CB
++
++the nodes sort by node->start value.
++*/
++int kbox_region_insert(KBOX_REGION_CB* cb)
++{
++
++	list_add_tail_rcu(&cb->list, &kbox_region_list);
++	return 0;
++}
++
++
++/*
++read data from region.
++\param	cb		region cb.
++\param	buffer_type	0:kernel buffer, 1:app buffer.
++					if it's an app buffer, should use copy_to_user to copy data.
++\param 	buffer	pointer to an buffer.
++\param	buflen	buffer length.
++\param	fpos	read position. should update it after read.
++\return	<0 :error 
++		>= the length of read.
++
++*/
++
++int kbox_region_read( KBOX_REGION_CB *cb, int buffer_type,
++	char *buffer, size_t buflen, loff_t *fpos)
++{
++	int len = 0;
++	char *from = NULL;
++	char *tmp_buff = NULL;
++	unsigned int start_len = 0;
++	unsigned long read_len = 0;
++	unsigned long total_len = 0;
++	int tmp_len = 0;
++	unsigned long flags = 0;
++	unsigned long end = 0;
++	unsigned long pos= 0;
++
++	if (buflen <= 0)
++		return -EINVAL;
++
++	tmp_buff = kmalloc(buflen, GFP_KERNEL);
++	if(!tmp_buff){
++		printk("alloc tmp_buff fail\n");
++		return -ENOMEM;
++	}
++
++	/*should lock the logbuf avoiding logbuf changed*/
++	KBOX_PRINTK_LOCK(&cb->logbuf_lock, flags);
++	/*adjust fpos before reading.*/
++	if ((unsigned long)*fpos < cb->pregion_des->log_start){
++		/*fpos is less than log_start, aligned it to log_start*/
++		*fpos = (loff_t)cb->pregion_des->log_start;
++	}
++	else if ((unsigned long)*fpos >= cb->pregion_des->log_end){
++		/*fpos exceeds log_end*/
++		KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++
++		kfree(tmp_buff);
++		return read_len;
++	
++	}
++
++	
++	end	= (cb->pregion_des->log_end)%(cb->size);
++	pos   = ((unsigned long)(*fpos))%(cb->size);
++	len = (int)buflen;
++
++	
++	/*
++	fops always be offset from log_start.
++	if log_start or log_end changed when reading, may miss reading 
++	some data. We don't care this condition.
++	
++	*/
++
++	if (pos >= end){
++		tmp_len = cb->size - pos + end;
++	}else{
++		tmp_len = end - pos;
++	}
++	
++
++	len = (tmp_len < len)?tmp_len:len;
++	from = cb->log_buf + pos;
++
++	while(read_len < len)
++	{
++		/*mes head is the last word or the last Byte*/
++		if(from >= cb->log_buf + cb->size)
++			from = from - cb->size;
++		
++		if(cb->part_copy == 0){
++			start_len = *((unsigned int *)from);
++			/*4byte head and 4byte end = 8*/
++			if(start_len == KBOX_LOGBUF_END_MAGIC)
++			{
++				break;
++			}
++
++			if(start_len == 0 || start_len > (cb->size - 8))
++			{
++				zero_log_buf(cb);
++				break;
++			}
++			
++			total_len += sizeof(unsigned int);
++			from += sizeof(unsigned int);
++		}
++		else{
++			start_len = cb->part_copy;
++			cb->part_copy = 0;
++		}
++
++		if(start_len > len && read_len ==0)
++		{
++			cb->part_copy = start_len - len;
++			start_len = len;
++		}
++		
++		if((start_len + read_len) > len){
++			total_len -= sizeof(unsigned int);
++			from -= sizeof(unsigned int);
++			break;
++		}
++		
++		if(from >= cb->log_buf + cb->size)/*mes head is the last word or the last Byte*/
++			from = cb->log_buf;
++		else if(from + start_len > cb->log_buf + cb->size)
++		{
++			tmp_len = cb->log_buf + cb->size - from;
++			memcpy(tmp_buff + read_len, from, tmp_len);
++
++			read_len += tmp_len;
++			start_len -= tmp_len;
++			total_len += tmp_len;
++			from = cb->log_buf;
++		}
++		memcpy(tmp_buff + read_len, from, start_len);
++
++		from += ALIGN(start_len, 4);
++		read_len += (start_len);
++		total_len += ( ALIGN(start_len, 4));
++
++		if(cb->part_copy != 0)
++			break;
++	}
++	KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++
++	if(copy_to_user(buffer, tmp_buff, read_len)){
++		kfree(tmp_buff);
++		return -EFAULT;
++	}
++
++	*fpos += (total_len);
++
++	kfree(tmp_buff);
++	return read_len;
++}
++
++int kbox_region_get_size(KBOX_REGION_CB *cb)
++{
++	int size;
++	unsigned long flags;
++	
++	/*should lock the logbuf avoiding logbuf changed*/
++	KBOX_PRINTK_LOCK(&cb->logbuf_lock, flags);
++	size = cb->pregion_des->log_end - cb->pregion_des->log_start;
++	KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++
++	return size;	
++
++}
++
++int kbox_create_region_action(char * create_name, int create_size, 
++	struct module *mod, unsigned char ignor_size)
++{
++	KBOX_REGION_CB *cb;
++	int ret = 0;
++	KBOX_REGION_DESC * kbox_logdes = NULL;
++
++	/*check if an region with the same name already exists*/
++	cb = kbox_region_find_by_name(create_name);
++	if (cb){
++		printk("exist the same name region!\n");
++		if(cb->size == create_size && (mod == NULL || !strncmp(cb->module_name, mod->name, KBOX_MODULE_NAME_LEN)))
++			cb->module = mod;
++		else {
++			printk("but registered difference size, or another module registered the region"
++				",\nso it failed!\n");
++			ret = -EEXIST;
++		}
++		goto out;
++	}
++	
++	ret = kbox_do_create_region(create_name, create_size, (unsigned char)ignor_size, &kbox_logdes);
++	if (ret < 0){
++		printk("\ndo_create_region fails!\n");
++		goto out;
++	}
++
++	cb = kbox_region_malloc(create_name, create_size, kbox_logdes,  mod);
++	if (!cb){
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/*after registered, mark that the kernel region has data.*/
++	kbox_region_insert(cb);
++
++out:
++	return (ret < 0) ? ret : cb->fd;
++}
++
++/**
++register an kernel region,which is logbuf type, for automatic flushing 
++
++\param	name	name of the buffer.
++\param	buf		the pointer to buffer.
++\param	len		the buffer size.
++\return 		0:OK; -1:fail.
++
++the registered buf must be reordered first, than
++
++*/
++int kbox_create_region(struct kbox_region *reg)
++{
++	int ret = 0;
++	
++	if (!reg ||!reg->size||reg->size != PAGE_ALIGN(reg->size) || reg->name[0] == '\0'){
++		return -EINVAL;
++	}
++	
++	ret = down_interruptible(&kbox_sem);
++	if (ret < 0){
++		/*-EINTR*/
++		return ret;
++	}
++
++	/*insert dev first*/
++	if(kbox_dev_cb.dev_status != KBOX_DEV_STATUS_FS_OK){
++		printk("\n--------------device is not OK--------------\n");
++		ret = -ENODEV;
++		goto out;
++	}
++	reg->name[KBOX_REGION_NAME_LEN - 1] = '\0';
++	ret = kbox_create_region_action(reg->name, reg->size, reg->mod, KBOX_MARK_SIZE);
++
++out:
++	up(&kbox_sem);
++
++	return ret;
++
++}
++
++
++EXPORT_SYMBOL(kbox_create_region);
++
++int kbox_create_default_reg(void)
++{
++	int ret;
++	KBOX_REGION_CB *entry = NULL;
++
++	kbox_default_region = NULL;
++	if(!kbox_default_reg_size){
++		printk("default region size could not be zero\n");
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = kbox_create_region_action("panic", PAGE_ALIGN(kbox_default_reg_size), THIS_MODULE, KBOX_IGNORE_SIZE);
++	if(ret < 0){
++		printk("registe default region fail, is it possible?\n");
++		goto out;
++	}
++	entry = list_first_entry_rcu(&kbox_region_list, KBOX_REGION_CB, list);
++	if (!entry ){
++		printk("kbox_unregister_region: fail\n");
++		goto out;
++	}
++
++	entry->fd = 0;
++	kbox_default_region = entry;
++	
++out:	
++	return ret;
++}
++
++
++
++size_t kbox_device_read(struct kbox_dev_des *cb, 
++	char *buf, size_t len, loff_t off)
++{
++	int ret = len;
++
++	if ((off + len) > cb->size){
++		ret = -EINVAL;
++		return (size_t)ret;
++	}
++	/*no need to check more params.*/
++
++	switch(cb->mode){
++		case KBOX_DEV_MODE_MAP:
++			memcpy(buf, cb->op_mapped_addr + off, len);
++			
++			break;
++		
++		case KBOX_DEV_MODE_CACHE:
++			ret = cb->op_read(cb, buf, len, off);
++			if (ret != len){
++				ret = -EFAULT;
++			}
++			break;
++		case KBOX_DEV_MODE_REDIRECT:
++			/*can not do read/write oper*/
++			if (cb->op_rread){
++				ret = cb->op_rread(cb, buf, len, off);
++				if (ret != len){
++					ret = -EFAULT;
++				}
++			}else{
++				ret = 0;
++			}
++
++			break;
++		default:
++			/*doesn't support these modes now*/
++			ret = -EINVAL;
++			break;
++	}
++
++	return (size_t)ret;
++}
++
++/*
++find an region in an kbox device.
++\param	name	the name of the region.
++\param	cb		the pointer to kbox device cb.
++
++*/
++KBOX_REGION_DESC *kbox_region_desc_find(char *name)
++{
++	KBOX_REGION_DESC * region = NULL;
++	KBOX_REGION_DESC * region_found = NULL;
++	int i = 0;
++	
++	if(name == NULL || kbox_memory_list.fs_head->file_count > KBOX_DEV_FILES_SUPPORT_MAX)
++		return NULL;
++
++	/*traverse the file table on device.*/
++	for(i = 0; i < kbox_memory_list.fs_head->file_count; i ++){
++		region = kbox_memory_list.region_table + i;
++		if (!strncmp(name, region->name, KBOX_REGION_NAME_LEN)){
++			region_found = region;
++			break;
++		}
++	}
++
++	return region_found;
++}
++
++/* find an empty region desc slot in an kbox device. */
++KBOX_REGION_DESC *kbox_region_desc_empty_find(void)
++{
++	if(kbox_memory_list.fs_head->file_count >= kbox_memory_list.fs_head->file_support){
++		printk("No enough kbox regoin\n");
++		return NULL;
++	}
++	return kbox_memory_list.region_table + kbox_memory_list.fs_head->file_count;
++}
++
++
++/*
++format a kbox device.
++\return	=0,Ok; <0, error. 
++
++	(1)kbox must be in maintain status.
++	(2)free old region desc table and alloc an new one.
++	(3)init fs_head and region desc table
++
++flushing the superblock into device will be done when mounting
++the device.
++
++*/
++int kbox_do_format_dev(void)
++{
++	int tmp_len = 0;
++	int ret = 0;
++	KBOX_FS_HEAD *fs_head = kbox_memory_list.fs_head;
++	KBOX_REGION_DESC *region_table = NULL;
++		
++	/*clean other fields of dev cb*/
++	tmp_len =  KBOX_DEV_FILES_SUPPORT_MAX * sizeof(KBOX_REGION_DESC);
++
++	/*init fs_head*/
++	memset(fs_head, 0 ,sizeof(*fs_head));
++	fs_head->basic.magic_num = cpu_to_be32(KBOX_FS_TYPE_KBOX_MAGIC);
++	fs_head->basic.verion = KBOX_FS_TYPE_KBOX_VER1;
++
++	KBOX_FS_SET_PAGE_ALIGNED(fs_head->basic.fs_flags);
++	kbox_memory_list.page_aligned = 1;
++
++	fs_head->basic.fs_type = KBOX_FS_TYPE_KBOX;
++	fs_head->basic.byteorder = KBOX_BYTEORDER;
++	fs_head->file_support = KBOX_DEV_FILES_SUPPORT_MAX;
++	fs_head->file_desc_size = sizeof(KBOX_REGION_DESC);
++	fs_head->file_count	=	0;
++	/*file_desc_table_offset is aligned to 64bit*/
++	fs_head->file_desc_table_offset= (sizeof(*fs_head) + 7)& (~7);
++
++	fs_head->basic.data_offset = PAGE_ALIGN(fs_head->file_desc_table_offset + tmp_len);
++	fs_head->basic.used_size = fs_head->basic.data_offset;
++	
++	/*make the new region table.*/
++	region_table = (KBOX_REGION_DESC *)((char*)kbox_memory_list.fs_head+ fs_head->file_desc_table_offset);
++
++	/*init region desc table*/
++	memset(region_table, 0 , tmp_len);
++	
++	kbox_memory_list.region_table = region_table;
++	kbox_memory_list.region_table_len = tmp_len;
++
++	update_checksum();
++
++	return ret;
++}
++
++
++/*
++create a region on an kbox device.
++\param	create_name	the name of region
++\param	create_sie	the size of region
++\return	=0,Ok; <0, error. 
++
++	find an empty region desc entry on dev.
++	find an data section for that region.
++	update superblock
++
++*/
++int kbox_do_create_region(char *create_name, int create_size, unsigned char flags, KBOX_REGION_DESC** plogdes)
++{
++	KBOX_REGION_DESC *region_desc = NULL;
++	int ret = 0;
++	u32 free_size = 0;
++
++	printk("kbox:create region %s, size=%u\n", create_name, (u32)create_size);
++	if(kbox_memory_list.fs_head->basic.magic_num != cpu_to_be32(KBOX_FS_TYPE_KBOX_MAGIC) )
++	{
++			(void)kbox_exception_dump(kbox_memory_list.memory_head, (size_t)kbox_memory_list.memory_size, 
++				"checked magicnum wrong when create region");
++
++			*plogdes = NULL;
++			ret = -EBFONT;
++			return ret;
++	}
++	
++	/*kernel region: search on current device only.A kernel region can be created on multiple device */
++	region_desc = kbox_region_desc_find(create_name);
++	if (region_desc){
++		/* we find the region in the device */
++		if(create_size != region_desc->size && !(flags && KBOX_IGNORE_SIZE)){
++			printk("create region %s in dev, but wrong size %d != %d\n", 
++				create_name, create_size, region_desc->size);
++			ret = -EINVAL;
++		}else
++		if(region_desc->offset + region_desc->size < region_desc->offset){
++			printk("data over flow offset %u, size %u\n", region_desc->offset, region_desc->size);
++			memset(region_desc, 0, sizeof(KBOX_REGION_DESC));
++			ret = -ENOSPC;
++		}else
++		if(region_desc->offset + region_desc->size > kbox_memory_list.memory_size){
++			printk("the context of regions behind %s is lost, mybe ur device size decreased\n", region_desc->name);
++			kbox_memory_list.fs_head->basic.used_size = region_desc->offset;
++			kbox_memory_list.fs_head->file_count = region_desc->index - 1;
++			memset(region_desc, 0, sizeof(KBOX_REGION_DESC)*(KBOX_DEV_FILES_SUPPORT_MAX - region_desc->index + 1));
++			update_checksum();
++			ret = -ENOSPC;
++		}else{
++			*plogdes = region_desc;
++		}
++	}
++	else{
++		free_size =  kbox_memory_list.memory_size - kbox_memory_list.fs_head->basic.used_size;
++		if (create_size > free_size) {
++			printk("Kbox create region: Out of memory!\n");
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		/*find an empty region desc slot*/
++		region_desc = kbox_region_desc_empty_find();
++		if (!region_desc){
++			printk("Kbox create region: Can't find empty region desc slot.\n");
++			ret = -ENOENT;
++			goto out;
++		}
++		
++		kbox_memory_list.fs_head->file_count++;
++		/*fill region desc*/
++		snprintf(region_desc->name, KBOX_REGION_NAME_LEN, 
++			"%s", create_name);
++		region_desc->size = PAGE_ALIGN(create_size);
++		region_desc->offset = kbox_memory_list.fs_head->basic.used_size;
++		region_desc->index = kbox_memory_list.fs_head->file_count;
++		region_desc->log_end = 0;
++		region_desc->log_start= 0;
++		region_desc->real_size= 0;
++		region_desc->flags = flags;
++		*plogdes = region_desc;
++
++		kbox_memory_list.fs_head->basic.used_size += region_desc->size ;
++		update_checksum();
++	}
++out:
++	return ret;
++}
++
++
++/*****************************************************************************
++ Function     :  erase all regions
++ Description  :  erase control brocks and device
++ Arg1           :  NA
++ Return        : 0: OK; < 0: fail.
++******************************************************************************/
++int kbox_erase_regions(void)
++{
++	int ret = 0;
++	KBOX_REGION_CB *entry = NULL;
++	printk("erase regions start\n");
++	/*destory the cb*/
++	while(!list_empty(&kbox_region_list))
++	{
++		entry = list_first_entry(&kbox_region_list, KBOX_REGION_CB, list);
++		if (!entry ){
++			printk("kbox_unregister_region:fail\n");
++			break;
++		}
++		printk("kbox_unregister_region: %s\n", entry->name);
++
++		list_del_rcu(&entry->list);
++
++		kbox_region_free(entry);
++	}
++
++	ret = kbox_do_format_dev();
++	if(ret < 0)
++		return ret;
++	printk("erase regions end\n");
++	return ret;
++}
++
++
++
++static void write_kbox_restart_log(void)
++{
++	char tbuf[64];
++	unsigned tlen;
++	unsigned long long t;
++	unsigned long nanosec_rem;
++
++	t = cpu_clock(0);
++	nanosec_rem = do_div(t, 1000000000);
++	tlen = snprintf(tbuf, 64, "------------------kbox restart:[%5lu.%06lu]----------------\n",
++			(unsigned long) t,
++			nanosec_rem / 1000);
++
++	(void)kbox_write(KBOX_DEFAULT_REG_ID, tbuf, tlen);
++}
++
++static bool check_fs_head(const char *name, char *warning_str)
++{
++	u32 checksum, checksum_tmp;
++
++	/*check fs_head*/
++	if (cpu_to_be32(KBOX_FS_TYPE_KBOX_MAGIC) != kbox_memory_list.fs_head->basic.magic_num){
++		printk("kbox: %s: verify fs magic fail. It's ok if first time using this device\n", name);
++		snprintf(warning_str, KBOX_WARNNING_LEN, "kbox verify fs magic fail\n");
++		return true;
++	}
++
++	checksum_tmp = kbox_memory_list.fs_head->basic.checksum;
++	/*we must set chechsum value 0 first for we can not add chechsum value to calculate it*/
++	kbox_memory_list.fs_head->basic.checksum = 0;
++	checksum = kbox_checksum((u8*)kbox_memory_list.fs_head, sizeof(*(kbox_memory_list.fs_head)));
++	checksum = cpu_to_be32(checksum);
++	if (checksum != checksum_tmp){
++		printk("kbox: %s: checksum fs head fail, format device\n", name);
++		snprintf(warning_str, KBOX_WARNNING_LEN, "kbox checksum fs head fail\n");
++		return true;
++	}
++	kbox_memory_list.fs_head->basic.checksum = checksum;
++
++	/*now we just support 16 regions*/
++	if( kbox_memory_list.fs_head->file_support != KBOX_DEV_FILES_SUPPORT_MAX){
++		snprintf(warning_str, KBOX_WARNNING_LEN, "kbox file_support num error\n");
++		return true;
++	}
++
++	if( kbox_memory_list.fs_head->file_count > kbox_memory_list.fs_head->file_support
++		|| (kbox_memory_list.fs_head->basic.used_size & (PAGE_SIZE-1))
++		|| kbox_memory_list.fs_head->basic.used_size > kbox_memory_list.memory_size){
++		return true;
++	}
++
++	return false;
++}
++
++static bool check_kbox_region_desc(char *warning_str)
++{
++	int i;
++	KBOX_REGION_DESC *region;
++	/*alloc memory for file desc table*/
++	kbox_memory_list.region_table = (KBOX_REGION_DESC *)((char*)kbox_memory_list.fs_head 
++		+ kbox_memory_list.fs_head->file_desc_table_offset);
++
++	/* should set the region table length, or the checksum of fs_head will be 0*/
++	kbox_memory_list.region_table_len = KBOX_DEV_FILES_SUPPORT_MAX * sizeof(KBOX_REGION_DESC);
++
++	/*checksum file desc table*/
++	region = kbox_memory_list.region_table;
++	for(i=0;i<kbox_memory_list.fs_head->file_count;i++){
++		if(region->log_start >= region->size){
++			snprintf(warning_str, KBOX_WARNNING_LEN, "%s 's start(%u)larger than size(%u)\n", 
++				region->name, region->log_start, region->size);
++			return true;
++		}
++		else if((region->log_end - region->log_start)  > (region->size - 4)){
++			/*4 means A5A5A5A5 at the messages end*/
++			snprintf(warning_str, KBOX_WARNNING_LEN, "%s 's space between start(%u) and end (%u) is larger than size(%u)\n", 
++				region->name, region->log_start, region->log_end, region->size);
++			return true;
++		}
++
++		if(region->index < 1){
++			snprintf(warning_str, KBOX_WARNNING_LEN, "%s 's 	index(%u) error", region->name, region->index);
++			return true;
++		}
++
++		region ++;
++	}
++
++	if (KBOX_FS_IS_PAGE_ALIGNED(kbox_memory_list.fs_head->basic.fs_flags)){
++		kbox_memory_list.page_aligned = 1;
++	}
++
++	return false;
++}
++
++static bool check_needs_formatting_device(struct kbox_dev_des *dev_desc, char *warning_str)
++{
++	if (check_fs_head(dev_desc->device_name, warning_str))
++		return true;
++
++	if (check_kbox_region_desc(warning_str))
++		return true;
++
++	return false;
++}
++
++/**
++\brief register an kbox device to kbox core
++\param	dev_desc	the pointer to kbox device's description structure.
++\return		0: OK; -1: fail.
++
++
++	(1)alloc an dev_cb;
++	(2)load superblock
++	(3)fsck superblock
++	(4)add to dev cb list.create proc entry for this dev
++
++*/
++int kbox_register_device(struct kbox_dev_des *dev_desc)
++{
++	int ret = 0;
++
++	char warning_str[KBOX_WARNNING_LEN];
++
++	if (!dev_desc || dev_desc->size < PAGE_SIZE || dev_desc->device_name == NULL || dev_desc->device_name[0] == '\0'){
++		return -EINVAL;
++	}
++
++
++	if(kbox_dev_cb.dev_status == KBOX_DEV_STATUS_FS_OK) {
++		printk("\n---------------had device--------------\n");
++		ret = -EBUSY;
++		goto out;
++	}
++
++	kbox_dev_cb.dev_desc = dev_desc;
++
++	kbox_memory_list.memory_head = dev_desc->op_mapped_addr;
++
++	if(kbox_memory_list.memory_head == NULL){
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	kbox_memory_list.memory_size = dev_desc->size;
++	kbox_memory_list.fs_head = (KBOX_FS_HEAD *)kbox_memory_list.memory_head;
++
++	/*load supperblock*/
++	kbox_dev_cb.dev_status = KBOX_DEV_STATUS_NOT_FORMAT;/*default value*/
++
++	if (!check_needs_formatting_device(dev_desc, warning_str))
++		goto REUSE_KBOX;
++
++	(void)kbox_exception_dump(kbox_memory_list.memory_head, (size_t)kbox_memory_list.memory_size, warning_str);
++	ret = kbox_do_format_dev();
++	if(ret < 0)
++		goto out;
++
++REUSE_KBOX:
++	ret = kbox_create_default_reg();
++	if(ret < 0){
++		goto out;
++	}
++
++	register_kbox_callback(kbox_create_region, kbox_write);
++
++	kbox_proc_devinfo->data = kbox_dev_cb.dev_desc;
++	kbox_dev_cb.dev_status = KBOX_DEV_STATUS_FS_OK;
++	write_kbox_restart_log();
++out:
++	return ret;
++}
++
++/**
++unregister an kbox device
++
++\param	name	name of the kbox device.
++
++	(1)must be in maintain mode.
++	(2)unreg proc entry
++	(3)free dev cb.
++
++*/
++int kbox_unregister_device(char *name)
++{
++	KBOX_REGION_CB *entry = NULL;
++	int ret = 0;
++
++	if(name == NULL || *name == '\0'){
++		printk("kbox: device name should not be \"\"\n");
++		return -EINVAL;
++	}
++
++	if(strncmp(kbox_dev_cb.dev_desc->device_name, name, KBOX_DEV_NAME_MAXLEN)){
++		return -EINVAL;
++	}
++	
++	ret = down_interruptible(&kbox_sem);
++	if (ret < 0){
++		/*-EINTR*/
++		return ret;
++	}
++
++	register_kbox_callback(NULL, NULL);
++
++	/*destory the cb*/
++	while(!list_empty(&kbox_region_list))
++	{
++		entry = list_first_entry(&kbox_region_list, KBOX_REGION_CB, list);
++
++		if (!entry ){
++			printk("kbox_unregister_region: fail\n");
++			break;
++		}
++		printk("kbox_unregister_region: %s\n", entry->name);
++
++		list_del_rcu(&entry->list);
++
++		kbox_region_free(entry);
++	}
++
++	kbox_memory_list.memory_head = NULL;
++	kbox_memory_list.memory_size = 0;
++
++	kbox_proc_devinfo->data =NULL;
++	kbox_region_fd = 0;
++
++	memset(&kbox_dev_cb, 0, sizeof(kbox_dev_cb));
++
++	up(&kbox_sem);
++	return ret;
++
++}
++
++EXPORT_SYMBOL(kbox_register_device);
++EXPORT_SYMBOL(kbox_unregister_device);
++
++
++/*
++initialize kbox core module 
++\return		0:OK; -1:fail
++*/
++int kbox_core_init(void)
++{	
++	INIT_LIST_HEAD(&kbox_region_list);
++	
++	if(!kbox_default_reg_size||kbox_default_reg_size != PAGE_ALIGN(kbox_default_reg_size) )
++		return -EINVAL;
++
++	sema_init(&kbox_sem, 1);
++	
++	/*init kbox device struct*/
++	memset(&kbox_dev_cb, 0, sizeof(kbox_dev_cb));
++	kbox_module = THIS_MODULE;
++
++	kbox_daemon = kthread_create(kbox_coredump, NULL, "kboxd");
++	if (IS_ERR(kbox_daemon)) {
++		printk(KERN_ERR "kbox init create kthread kbox_coredump failed!\n");
++		kbox_daemon = NULL;
++		goto out;
++	}
++	wake_up_process(kbox_daemon);
++out:
++	return 0;
++}
++
++/*
++finalize kbox core module 
++\return		0:OK; -1:fail
++*/
++int kbox_core_fini(void)
++{	
++	if(kbox_daemon != NULL){
++		kthread_stop(kbox_daemon);
++	}
++	
++	if(dump_start != NULL){
++		vfree(dump_start);
++		dump_start = NULL;
++	}
++	return 0;
++}
++
+diff --git a/kernel/kbox/kbox_core.h b/kernel/kbox/kbox_core.h
+new file mode 100644
+index 00000000..602a4b87
+--- /dev/null
++++ b/kernel/kbox/kbox_core.h
+@@ -0,0 +1,202 @@
++
++#ifndef __KBOX_CORE_H
++#define __KBOX_CORE_H
++
++/*-----------------------------------------------------------------------------
++kbox device definition
++*/
++
++/*max devices that kbox supports*/
++#define KBOX_DEV_DEVICES_SUPPORT_MAX	 (1)
++
++/*default regions in an device*/
++#ifdef CONFIG_KBOX_MAX_REG
++#define KBOX_DEV_FILES_SUPPORT_MAX CONFIG_KBOX_MAX_REG
++#else
++#define KBOX_DEV_FILES_SUPPORT_MAX (64)
++#endif
++
++#define KBOX_DEFAULT_REG_SIZE 65536
++
++/*-----------------------------------------------------------------------------
++kbox file sytem definition
++*/
++
++/*kbox fs flags */
++#define KBOX_FS_PAGE_ALIGNED			(1)
++#define KBOX_FS_ALWAYS_CACHE			(2)
++
++#define KBOX_FS_IS_PAGE_ALIGNED(X)		((X) & KBOX_FS_PAGE_ALIGNED)
++#define KBOX_FS_IS_ALWAYS_CACHE(X)		((X) & KBOX_FS_ALWAYS_CACHE)
++
++#define KBOX_FS_SET_PAGE_ALIGNED(X)		((X) |= KBOX_FS_PAGE_ALIGNED)
++#define KBOX_FS_SET_ALWAYS_CACHE(X)		((X) |= KBOX_FS_ALWAYS_CACHE)
++
++
++
++/*kbox region type*/
++#define KBOX_IGNORE_SIZE		(0x01)
++#define KBOX_MARK_SIZE		(0x00)
++
++/*the fs now kbox support.*/
++#define KBOX_FS_TYPE_KBOX				(0x01)
++#define KBOX_FS_TYPE_FLASH				(0x02)
++#define KBOX_FS_TYPE_STREAM				(0x03)
++
++/*kbox fs version*/
++#define KBOX_FS_TYPE_KBOX_VER1			(0x01)
++/*kbox fs magic num*/
++#define KBOX_FS_TYPE_KBOX_MAGIC			(0xA5A6A7A8)
++
++/*kbox logbuf end magic num*/
++#define KBOX_LOGBUF_END_MAGIC			(0xA5A5A5A5)
++
++#define KBOX_BUFF_ONE_TIME			(4096-sizeof(unsigned int)*2)
++
++#define KBOX_WARNNING_LEN	 (128)
++
++/* brief basic fs header of an kbox device file system in device or in momery 24*/
++typedef struct tag_KBOX_FS_HEAD_BASIC{
++	/*basic info*/
++	u32	checksum;	/*checksum the fs head.*/
++	u32 	magic_num;	/*kbox fs magic number*/
++	u32	verion;     /*fs version*/
++	u32 	used_size;	/*the size of used device*/
++	u16 	fs_flags;	
++	u8 	fs_type;	/*fs type*/
++	u8	byteorder;	/*byteorder*/
++	u32	data_offset;	
++}__attribute__((packed)) KBOX_FS_HEAD_BASIC;
++
++/* brief Supper Block of an kbox device file system in device or in momery 36*/
++typedef struct tag_KBOX_FS_HEAD{
++	KBOX_FS_HEAD_BASIC basic;
++	/*extend info. according to fs type and version.*/		
++	/*file management*/
++	u16 	file_support;   /*max files support in this dev*/
++	u16  file_desc_size; 
++	u16 	file_count;  /*total files in this device*/
++	u16 	file_desc_table_offset ; /*offset in bytes*/
++	u32	file_desc_table_checksum;/*checksum of file_desc_table*/
++	//char cfg_sum[KBOX_CFG_MD5_LEN];
++}__attribute__((packed)) KBOX_FS_HEAD;
++
++
++/* brief control Block of an region in device. 59*/
++typedef struct tag_KBOX_REGION_DESC{
++	char 	name[KBOX_REGION_NAME_LEN];
++	u8 		index;
++	u8 		flags;
++	u8		reserved;
++	u32 		offset;
++	u32 		size; /* the space reserved for this file*/
++	u32		real_size;/*how many data has writen to file.*/
++	u32		log_start;	/* Index into log_buf: next char to be read by an reader*/
++	u32 		log_end;/* Index into log_buf: most-recently-written-char + 1 */
++	/*when we update the file.*/
++	u32		ts_sec; 
++
++}__attribute__((packed)) KBOX_REGION_DESC;/*should align to 64 bytes.*/
++
++
++
++typedef struct tag_KBOX_MEMORY
++{
++	char* memory_head;
++	unsigned long memory_size;
++	/*the supperblock current using*/
++	KBOX_FS_HEAD			*fs_head;
++	KBOX_REGION_DESC		*region_table;
++	int						region_table_len;
++	int 					page_aligned;/*if page aligned when allocating */
++}KBOX_MEMORY;
++
++/* kbox dev ioctl  */
++#define KBOX_DEV_NOT_FOUND (-998)
++#define KBOX_REG_NOT_FOUND (-999)
++
++/*get byte order
++1: big endian
++0: little endian.
++*/
++#define KBOX_BYTEORDER (cpu_to_be16(0x0A0B) == (0x0A0B)? 1:0)
++
++/*
++\brief Control Block of an kbox device in memory
++
++every time update the fs_head to kbox device, must follow these steps:
++(1)update the new fs_head.
++(2)write the new fs_head to device.
++(3)update fs_head.
++
++the process is not reentry. 
++
++*/
++typedef struct tag_KBOX_DEV_CB{
++	/*dev cd related*/
++	int						dev_ref;
++	/*device related*/
++	u32						dev_status;
++	struct proc_dir_entry		*proc_entry;
++	struct kbox_dev_des 		*dev_desc;
++}KBOX_DEV_CB;
++
++#define KBOX_MODULE_NAME_LEN (64 - sizeof(unsigned long))
++
++typedef struct tag_KBOX_REGION_CB{
++	struct list_head list;
++	char 	name[KBOX_REGION_NAME_LEN];
++	unsigned int	magic;
++
++	int		fd;	/*unique id*/
++	unsigned int size;  /*size of this region*/
++
++	unsigned int real_size;/*how many data has writen to file.*/
++	unsigned int log_start;	/* Index into log_buf: next char to be read by an reader*/
++	unsigned int log_end;/* Index into log_buf: most-recently-written-char + 1 */
++
++	int is_reading;
++	struct module *module; /*which module belongs to*/
++	char		module_name[KBOX_MODULE_NAME_LEN];
++
++	char*	log_buf;
++
++	unsigned int 	part_copy;
++
++	/*logbuf_lock protects this cb.*/
++	spinlock_t 		logbuf_lock;
++
++	struct proc_dir_entry *proc_entry;
++	
++	KBOX_REGION_DESC* pregion_des;
++
++}KBOX_REGION_CB;
++
++extern struct semaphore	kbox_sem;
++
++extern struct list_head kbox_region_list;
++
++extern int kbox_exception_dump(void *viraddr, size_t length, char *warnstr);
++extern int kbox_erase_regions(void);
++
++extern void kbox_sync(int rfd);
++extern int kbox_region_read( KBOX_REGION_CB *cb, int buffer_type,
++	char *buffer, size_t buflen, loff_t *fpos);
++
++extern KBOX_REGION_CB* kbox_region_find(int rfd);
++
++extern size_t kbox_device_read(struct kbox_dev_des *cb, 
++	char *buf, size_t len, loff_t off);
++extern int kbox_create_region_action(char * create_name, int create_size, 
++	struct module *mod, unsigned char ignor_size);
++extern int kbox_do_create_region(char *create_name, int create_size, unsigned char flags, KBOX_REGION_DESC** plogdes);
++extern int kbox_create_default_reg(void);
++
++extern void zero_log_buf(KBOX_REGION_CB* cb);
++extern int wakeup_kboxd(void *start, unsigned long len, char *warnstr);
++extern int kbox_do_format_dev(void);
++extern int kbox_core_init(void);
++extern int kbox_core_fini(void);
++
++
++#endif
+diff --git a/kernel/kbox/kbox_dev.c b/kernel/kbox/kbox_dev.c
+new file mode 100644
+index 00000000..4e1ecd56
+--- /dev/null
++++ b/kernel/kbox/kbox_dev.c
+@@ -0,0 +1,186 @@
++#include "kbox_include.h"
++
++int kbox_dev_major = 0;
++dev_t devno;
++static struct cdev kbox_cdev;
++static struct class *kbox_class;
++extern KBOX_DEV_CB	kbox_dev_cb;
++
++static ssize_t	kbox_dev_read (struct file *filp, 
++	char __user *buf, size_t count, loff_t *f_pos)
++{
++	return 0;
++}
++
++static ssize_t	kbox_dev_write (struct file *filp, 
++	const char __user *buf, size_t count, loff_t *f_pos)
++{
++	int ret = 0;
++	char *kern_buf = NULL;
++	int rfd;
++
++	if(count <= 0)
++		return -EINVAL;
++
++	rfd = (int)filp->private_data;
++
++	kern_buf = kmalloc(count, GFP_KERNEL);
++	if(kern_buf == NULL)
++	{
++		return -ENOMEM;
++	}
++
++	if (copy_from_user (kern_buf, buf, count)) {
++		kfree(kern_buf);
++		return  -EFAULT;
++	}
++	
++	ret = kbox_write(rfd, kern_buf, count);
++
++	kfree(kern_buf);	
++	return ret;
++}
++/*
++The ioctl() implementation for kbox fs
++*/
++static int kbox_dev_ioctl_common ( struct file *filp, unsigned int cmd
++									, unsigned long arg)
++{
++
++	int ret = 0;
++	/*insert dev first*/
++	if(kbox_dev_cb.dev_status != KBOX_DEV_STATUS_FS_OK){
++		printk("\n--------------device is not OK--------------\n");
++		return -ENODEV;
++	}
++
++	/* don't even decode wrong cmds: better returning  ENOTTY than EFAULT */
++	if (_IOC_TYPE(cmd) != KBOX_IOC_MAGIC){
++		printk("\nplease input correct command\n");
++		return -EINVAL;
++
++	}
++
++	ret = down_interruptible(&kbox_sem);
++	if (ret < 0){
++		/*-EINTR*/
++		return ret;
++	}
++	
++	switch(cmd) 
++	{
++		case KBOX_IOC_CREATE_REGION:
++			{
++				struct kbox_region ioc_cb;
++				if (copy_from_user (&ioc_cb, (void*)arg, sizeof(ioc_cb))) {
++					ret = -EFAULT;
++					break;
++				}
++				
++				if (!ioc_cb.size||ioc_cb.size != PAGE_ALIGN(ioc_cb.size) || ioc_cb.name[0] == '\0'){
++					printk("\ninvalidate parameter\n");
++					ret = -EINVAL;
++					break;
++				}
++				ioc_cb.name[KBOX_REGION_NAME_LEN - 1] = '\0';
++				ret = kbox_create_region_action(ioc_cb.name, (int)ioc_cb.size, THIS_MODULE, KBOX_MARK_SIZE);
++
++				if(ret < 0)
++					break;
++
++				filp->private_data = (void *)ret;
++			}				
++			break;
++		default:  
++			printk("\nnot support this command\n");
++			ret = -EINVAL;
++			break;
++	}
++
++	up(&kbox_sem);
++	return ret;
++}
++
++
++/*
++The ioctl() implementation for kbox dev
++*/
++static long kbox_dev_ioctl (struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	return kbox_dev_ioctl_common(filp,cmd,arg);
++}
++
++
++static int		kbox_dev_open (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int		kbox_dev_release (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++/*
++kbox dev fops
++*/
++struct file_operations kbox_dev_fops = {
++	.owner =     THIS_MODULE,
++	.read =	     kbox_dev_read,
++	.write =     kbox_dev_write,
++	.unlocked_ioctl =     kbox_dev_ioctl,
++	.compat_ioctl   = kbox_dev_ioctl,
++	.open =	     kbox_dev_open,
++	.release =   kbox_dev_release,
++};
++
++/*
++init kbox dev
++*/
++int kbox_dev_init(void){
++	int ret = 0;
++
++	/*Register your major, and accept a dynamic number.*/
++	ret = alloc_chrdev_region(&devno, 0, 1, KBOX_DEV_NAME);
++	kbox_dev_major = MAJOR(devno);
++	if (ret < 0){
++		return ret;
++	}
++
++	/*init kbox dev*/
++   	cdev_init(&kbox_cdev, &kbox_dev_fops);
++	kbox_cdev.owner = THIS_MODULE;
++	devno = MKDEV(kbox_dev_major, 0);
++	ret = cdev_add (&kbox_cdev, devno, 1);
++	if (ret < 0){
++		printk(KERN_NOTICE "Error %d adding kbox dev\n", ret);
++		unregister_chrdev_region(devno, 1);
++		goto out;
++	}
++
++	kbox_class = class_create(THIS_MODULE, KBOX_DEV_NAME);
++	if(IS_ERR(kbox_class)){
++		printk("class create fail!\n");
++		cdev_del(&kbox_cdev);
++		unregister_chrdev_region(devno, 1);
++		ret = -ENODEV;
++		goto out;
++	}
++	device_create(kbox_class, NULL, devno, NULL, KBOX_DEV_NAME);
++
++out:
++	return ret;
++}
++
++/*
++cleanup kbox dev
++*/
++void kbox_dev_fini(void){
++	device_destroy(kbox_class, devno);
++	class_destroy(kbox_class);
++
++	/*remove kbox cdev */
++	cdev_del(&kbox_cdev);
++	unregister_chrdev_region(MKDEV(kbox_dev_major, 0), 1);
++}
++
+diff --git a/kernel/kbox/kbox_dev.h b/kernel/kbox/kbox_dev.h
+new file mode 100644
+index 00000000..64fbadd1
+--- /dev/null
++++ b/kernel/kbox/kbox_dev.h
+@@ -0,0 +1,8 @@
++#ifndef __KBOX_DEV_H
++#define __KBOX_DEV_H
++
++#define	KBOX_DEV_NAME		"kbox"
++
++extern int kbox_dev_init(void);
++extern void kbox_dev_fini(void);
++#endif
+diff --git a/kernel/kbox/kbox_include.h b/kernel/kbox/kbox_include.h
+new file mode 100644
+index 00000000..83740b5c
+--- /dev/null
++++ b/kernel/kbox/kbox_include.h
+@@ -0,0 +1,133 @@
++#ifndef __KBOX_INCLUDE_
++#define __KBOX_INCLUDE_
++
++/* #include <linux/config.h> */
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/init.h>
++#include <linux/kernel.h>	/* printk() */
++#include <linux/slab.h>		/* kmalloc() */
++#include <linux/fs.h>		/* everything... */
++#include <linux/errno.h>	/* error codes */
++#include <linux/types.h>	/* size_t */
++#include <linux/proc_fs.h>
++#include <linux/fcntl.h>	/* O_ACCMODE */
++#include <linux/aio.h>
++#include <asm/uaccess.h>
++
++/* #include <linux/config.h> */
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/init.h>
++
++#include <linux/kernel.h>	/* printk() */
++#include <linux/slab.h>		/* kmalloc() */
++#include <linux/fs.h>		/* everything... */
++#include <linux/errno.h>	/* error codes */
++#include <linux/types.h>	/* size_t */
++#include <linux/proc_fs.h>
++#include <linux/fcntl.h>	/* O_ACCMODE */
++#include <linux/seq_file.h>
++#include <linux/cdev.h>
++#include <linux/delay.h> /* mdelay */
++#include <linux/bootmem.h>  /* inb() outb() */
++
++#include <asm/system.h>		/* cli(), *_flags */
++#include <asm/uaccess.h>	/* copy_*_user */
++
++#include <linux/notifier.h> /* for panic notify */
++#include <linux/ptrace.h>
++//#include <linux/dumpdev.h>
++
++#ifdef KBOX_SUPPORT_DIE
++#include <asm/kdebug.h>
++#endif
++
++#include <linux/reboot.h>
++#include <linux/notifier.h>
++#include <asm/processor.h>
++//#include <asm/desc.h>
++#include <asm/unistd.h>
++#include <linux/seq_file.h>
++
++/*add for maps*/
++
++/*from seq_file.c*/
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++
++#include <asm/uaccess.h>
++#include <asm/page.h>
++
++
++
++/*from dcache.c*/
++/* #include <linux/config.h> */
++#include <linux/syscalls.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/fs.h>
++//#include <linux/fsnotify.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/smp_lock.h>
++#include <linux/hash.h>
++#include <linux/cache.h>
++#include <linux/module.h>
++#include <linux/mount.h>
++#include <linux/file.h>
++#include <asm/uaccess.h>
++#include <linux/security.h>
++#include <linux/seqlock.h>
++#include <linux/swap.h>
++#include <linux/bootmem.h>
++
++/*from pageattr.c*/
++/* #include <linux/config.h> */
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/highmem.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <asm/processor.h>
++#include <asm/tlbflush.h>
++#include <asm/pgalloc.h>
++#include <asm/sections.h>
++#include <asm/pgtable.h>
++
++#include <linux/nmi.h>
++#ifdef KBOX_LINUX_VERSION_2_6_14_X
++#include <linux/nmi_watchdog.h>
++#endif
++
++#include <linux/rtc.h>
++#include <linux/profile.h>
++
++#include <linux/hugetlb.h>
++#include <linux/notifier.h>
++
++#include <linux/kallsyms.h>
++#include <asm/ptrace.h>
++#include <linux/namei.h>
++#include <linux/kthread.h>
++#include <asm/atomic.h>
++
++/*kbox header files*/
++#include <linux/kbox/kbox.h>
++#include <linux/set_kbox_region.h>
++#include "kbox_main.h"
++#include "kbox_proc.h"
++#include "kbox_core.h"
++#include "kbox_dev.h"
++
++#ifdef CONFIG_COMPAT
++#include "asm/compat.h"
++#endif
++
++#include <linux/fs_struct.h>
++#include <linux/vmalloc.h>
++
++#endif
+diff --git a/kernel/kbox/kbox_logbuf.c b/kernel/kbox/kbox_logbuf.c
+new file mode 100644
+index 00000000..a7a85a23
+--- /dev/null
++++ b/kernel/kbox/kbox_logbuf.c
+@@ -0,0 +1,308 @@
++#include "kbox_include.h"
++
++#define KBOX_LOG_BUF(cb,idx) (cb->log_buf[(idx)%(cb->size)])
++
++#define TS_BUFSIZE 16
++/*support only to  x86 and arm architecture*/
++#define KERNEL_OFFSET (MODULES_VADDR > PAGE_OFFSET ? PAGE_OFFSET : MODULES_VADDR)
++/*one for \0, end of string*/
++char timestamp_buf[TS_BUFSIZE + 1 ] = {"\0"};
++static int new_line = 1;
++
++extern KBOX_MEMORY	kbox_memory_list;
++extern KBOX_REGION_CB *kbox_default_region;
++extern KBOX_DEV_CB	kbox_dev_cb;
++
++int record_time = 0;
++module_param_named(time, record_time, bool, S_IRUGO | S_IWUSR);
++
++
++/*
++Write the buffer content of sepcified length directly to region buffer 
++|head|---body---|head|---body---|A5A5A5A5|--------|
++   4b         n b          4b         n b         4b
++*/
++
++#define MSG_HEAD_SIZE sizeof(unsigned int)
++#define MSG_END_SIZE sizeof(unsigned int)
++
++void zero_log_buf(KBOX_REGION_CB* cb)
++{	
++	char warn_str[KBOX_WARNNING_LEN];
++	
++	snprintf(warn_str, KBOX_WARNNING_LEN, "size:%u,start:%u,end:%u,region:%s\n", 
++		cb->pregion_des->size,  cb->pregion_des->log_start, 
++		cb->pregion_des->log_end, cb->name);
++
++	/*there we disable irq, so we start a thread to do dump,and we can't call printk here*/
++	(void)wakeup_kboxd(cb->log_buf, cb->pregion_des->size, warn_str);
++
++	cb->pregion_des->real_size = 0;
++	cb->pregion_des->log_start = 0;
++	cb->pregion_des->log_end = 0;
++	cb->pregion_des->size=cb->size;
++}
++
++
++static int kbox_write_data(KBOX_REGION_CB* cb, const char * buff,unsigned int len)
++{
++	unsigned int write_len = len;
++	unsigned int *msg_head = NULL;
++	unsigned int msg_len, need_len,free_len,end_position;
++	unsigned int *end_magic = NULL;
++	const char *source = buff;
++	char *from = NULL;
++
++	need_len = (ALIGN(len, 4) + MSG_HEAD_SIZE + MSG_END_SIZE);
++	free_len = cb->size - (cb->pregion_des->log_end - cb->pregion_des->log_start);
++	
++	while(free_len < need_len){
++		msg_len =  *(unsigned int *)(cb->log_buf + 
++			(cb->pregion_des->log_start % cb->size));
++		if(ALIGN(msg_len, 4) + MSG_HEAD_SIZE + MSG_END_SIZE > cb->size){
++			zero_log_buf(cb);
++			break;
++		}
++		else{
++			cb->pregion_des->log_start += (ALIGN(msg_len, 4) + MSG_HEAD_SIZE);
++			if(cb->pregion_des->log_start > cb->pregion_des->log_end){
++				zero_log_buf(cb);
++				break;
++			}
++		}
++
++		free_len = cb->size - (cb->pregion_des->log_end - cb->pregion_des->log_start);
++	}
++	from = &(KBOX_LOG_BUF(cb, cb->pregion_des->log_end));
++
++	/*recode the message len*/
++	msg_head = (unsigned int*)from;
++	from += MSG_HEAD_SIZE;
++
++	if(cb->size - (from - cb->log_buf) < ALIGN(len, 4)){
++		write_len = cb->size - (from - cb->log_buf);
++		memcpy(from, source, write_len);
++		from = cb->log_buf;
++		source += write_len;
++		write_len = len - write_len;
++	}
++
++
++	memcpy(from, source, write_len);
++
++	end_position = cb->pregion_des->log_end + (ALIGN(len, 4) + sizeof(unsigned int));
++	end_magic = (unsigned int *)(cb->log_buf + end_position%cb->size);
++	*end_magic = KBOX_LOGBUF_END_MAGIC;
++
++	/*after write all data, we update the message len*/
++	*msg_head = len;
++
++	cb->pregion_des->log_end = end_position;
++
++	return len;
++}
++
++int kbox_write(int rfd, const char * buff,unsigned len)
++{
++	KBOX_REGION_CB* cb = NULL;
++	unsigned int limit_len =0;
++	unsigned long flags;
++	
++	if(len == 0)
++		return 0;
++
++	if(rfd < 0 || !buff || (uintptr_t)buff < KERNEL_OFFSET){
++		return -EINVAL;
++	}
++	
++	cb = kbox_region_find(rfd);
++	
++	if(kbox_dev_cb.dev_status != KBOX_DEV_STATUS_FS_OK){
++		return -EBUSY;	
++	}
++	else if(!cb){
++		/*not find this region*/
++		if(kbox_default_region == NULL)
++			return -EINVAL;
++		cb = kbox_default_region;
++	} 	
++
++	if (KBOX_LOG_BUF_CB_MAGIC != cb->magic){
++		/*this not a illegal log_buf*/
++		return -EIO;
++	}
++
++	if(cb->is_reading)
++		return -EBUSY;
++	
++	KBOX_PRINTK_LOCK(&cb->logbuf_lock, flags);
++
++	limit_len =  cb->size - MSG_HEAD_SIZE - MSG_END_SIZE;
++	if(record_time)
++		limit_len -= (TS_BUFSIZE + MSG_HEAD_SIZE);
++	
++	if(len > limit_len || cb->pregion_des->log_start > cb->size){
++		len = limit_len> len ? len: limit_len;
++
++		cb->pregion_des->real_size = 0;
++		cb->pregion_des->log_start = 0;
++		cb->pregion_des->log_end = 0;
++	}
++	if(record_time){
++		if(new_line){
++			struct timeval now;
++			struct rtc_time tm;
++			new_line = 0;
++			
++			do_gettimeofday(&now);
++	    
++			rtc_time_to_tm(now.tv_sec, &tm);
++			snprintf(timestamp_buf, TS_BUFSIZE + 1, "[%02d%02d%02d%02d%02d%02d]",
++		       	tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
++			/*ignor the last \0*/
++			kbox_write_data(cb, timestamp_buf, TS_BUFSIZE);
++		}
++		if(buff[len -1] == '\n')
++			new_line = 1;
++	}
++
++	kbox_write_data(cb, buff, len);
++
++	/*if it run long time , the recoded messages len may more than a long var*/
++	if(cb->pregion_des->log_start >= cb->size)
++	{
++		/*one message would not  long than log_buf_len*/
++		cb->pregion_des->log_start -=  cb->size;
++		cb->pregion_des->log_end -=  cb->size;
++	}
++
++ 	cb->pregion_des->real_size = cb->pregion_des->log_end - cb->pregion_des->log_start;
++
++	KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++
++	return len;
++}
++
++
++EXPORT_SYMBOL(kbox_write);
++
++
++int kbox_visit_start(int region_id, struct kbox_iter *cur)
++{
++	KBOX_REGION_CB* cb = NULL;
++	unsigned long flags;
++	unsigned int *msg_len = NULL;
++	int ret = 0;
++
++	if( !cur){
++		printk("w0o0o0o, iterator NULL?\n");
++		return -EINVAL;
++	}
++
++	if(region_id< 0){
++		printk("Ho0o0o, no region id is negative\n");
++		ret = -EINVAL;
++		goto fail;
++	}
++
++	if (down_interruptible(&kbox_sem) < 0){
++		/*-EINTR*/
++		cur->locked = 0;
++		ret = -EINTR;
++		goto fail;
++	}
++	cur->locked = 0xbad;
++
++	cb = kbox_region_find(region_id);
++	if(cb == NULL)
++	{
++		printk("Sorry, not find the %d region\n", region_id);
++		
++		up(&kbox_sem);
++		cur->locked = 0;
++		ret = -EINVAL;
++		goto fail;
++	}
++	
++	preempt_disable();
++	KBOX_PRINTK_LOCK(&cb->logbuf_lock, flags);
++	cb->is_reading = 1;
++	cur->start_read = cb->log_buf + cb->pregion_des->log_start;
++	cur->total = cb->pregion_des->log_end - cb->pregion_des->log_start;
++	cur->arg = (void *)cb;
++	KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++	preempt_enable();
++
++	if(cur->total <= 0 || cur->total > cb->size){
++		ret = 0;
++		goto fail;
++	}
++	
++	cur->buff = cur->start_read + MSG_HEAD_SIZE;
++	msg_len = (unsigned int*)(cur->start_read);
++	cur->len = (size_t)*msg_len;
++//	cur->buff = NULL;
++//	cur->len = 0;
++	cur->read_len = 0;
++	return 1;
++	
++fail:
++	cur->start_read = NULL;
++	return ret;	
++}
++EXPORT_SYMBOL(kbox_visit_start);
++
++int kbox_visit_next(struct kbox_iter *cur)
++{
++	unsigned int *msg_len = NULL;
++	
++	if(!cur || cur->start_read == NULL)
++	{
++		return 0;
++	}
++	
++	cur->total -= (ALIGN(cur->len, 4) + MSG_HEAD_SIZE);
++	if(cur->total <= 0 )
++	{
++		cur->start_read = NULL;
++		return 0;
++	}
++
++	cur->start_read += ALIGN(cur->len, 4) + MSG_HEAD_SIZE;
++	cur->buff = cur->start_read + MSG_HEAD_SIZE;
++	msg_len = (unsigned int*)(cur->start_read);
++	cur->len = (size_t)*msg_len;
++	return 1;
++}
++EXPORT_SYMBOL(kbox_visit_next);
++
++void kbox_visit_stop(struct kbox_iter *cur)
++{
++	KBOX_REGION_CB* cb = NULL;
++	if(!cur)
++		return ;
++
++	cb = (KBOX_REGION_CB*)cur->arg;
++	cb->is_reading = 0;
++	if(cur->locked == 0xbad){
++		up(&kbox_sem);
++		cur->locked = 0;
++	}
++}
++EXPORT_SYMBOL(kbox_visit_stop);
++
++int kbox_iter_read(struct kbox_iter *cur, int (*reader)(const char *buf, size_t len, void *arg), void *arg)
++{
++	int ret = 0;
++
++	if(!cur)
++		return -EINVAL;
++
++	if(reader)
++		ret = (*reader)(cur->buff, cur->len, arg);
++	cur->read_len += cur->len;
++	
++	return ret;
++}
++EXPORT_SYMBOL(kbox_iter_read);
++
+diff --git a/kernel/kbox/kbox_main.c b/kernel/kbox/kbox_main.c
+new file mode 100644
+index 00000000..5dd30cbd
+--- /dev/null
++++ b/kernel/kbox/kbox_main.c
+@@ -0,0 +1,69 @@
++#include "kbox_include.h"
++
++/*kbox module description*/
++MODULE_AUTHOR(KBOX_MODULE_AUTHOR);
++MODULE_DESCRIPTION(KBOX_MODULE_DESCRIPTION);
++MODULE_VERSION(KBOX_MODUEL_VERSION);
++MODULE_LICENSE(KBOX_MODULE_LICENSE);
++
++extern int ddr_ram_init(void);
++extern void ddr_ram_exit(void);
++/**
++init kbox module
++*/
++static int __init kbox_init(void)
++{
++	int ret = 0;
++
++	ret = kbox_core_init();
++	if (ret < 0){
++		printk("kbox:init core fail ret=%d\n", ret);
++		goto fail1;
++	}
++	ret = kbox_proc_init();
++	if (ret < 0){
++		printk("kbox:init proc fail ret=%d\n", ret);
++		goto fail2;
++	}
++	ret = ddr_ram_init();
++	if(ret < 0){
++		printk("kbox: init ddrram fail ret=%d\n", ret);
++	}
++	ret = kbox_dev_init();
++	if (ret < 0){
++		printk("kbox:init dev fail ret=%d\n", ret);
++		goto fail4;
++	}
++	printk("kbox: load OK\n");
++	return 0;
++	
++fail4:
++	ddr_ram_exit();	
++
++	kbox_proc_fini();
++fail2:	
++	kbox_core_fini();
++
++fail1:	
++	return ret;
++
++}
++
++/**
++cleanup kbox module
++*/
++static void __exit kbox_fini(void)
++{
++	kbox_dev_fini();
++
++	ddr_ram_exit();	
++
++	kbox_proc_fini();
++	
++	kbox_core_fini();
++}
++
++late_initcall(kbox_init);
++module_exit(kbox_fini);
++
++
+diff --git a/kernel/kbox/kbox_main.h b/kernel/kbox/kbox_main.h
+new file mode 100644
+index 00000000..49255a3d
+--- /dev/null
++++ b/kernel/kbox/kbox_main.h
+@@ -0,0 +1,47 @@
++#ifndef __KBOX_MAIN_H
++#define __KBOX_MAIN_H
++
++#define KBOX_MODUEL_VERSION				"KBOX-0.1.1"
++#define KBOX_MODULE_DESCRIPTION			"RTOS KBOX"
++#define KBOX_MODULE_AUTHOR				"HUAWEI TECHNOLOGIES CO., LTD."
++#define KBOX_MODULE_LICENSE				"GPL"
++
++
++#define KBOX_DEBUG_PRINTK 0 
++#define KBOX_DEBUG_ASSERT 1
++
++
++#if KBOX_DEBUG_ASSERT
++#define KBOX_ASSERT(expr) \
++          if(unlikely(!(expr))) {               \
++          printk(KERN_ERR "Assertion failed! %s,%s,%s,line=%d\n", \
++        #expr,__FILE__,__FUNCTION__,__LINE__);		        \
++			dump_stack();\
++          }
++#else
++#define KBOX_ASSERT(expr) do {} while (0)
++#endif
++
++
++
++#if KBOX_DEBUG_PRINTK
++#define KBOX_PRINTK(fmt,...) printk(fmt,##__VA_ARGS__)
++#else
++#define KBOX_PRINTK(fmt,...) 	
++
++#endif
++
++#ifndef UNUSED
++#define UNUSED(x)	(x) = (x)
++#endif
++
++
++
++
++
++
++
++
++
++
++#endif
+diff --git a/kernel/kbox/kbox_proc.c b/kernel/kbox/kbox_proc.c
+new file mode 100644
+index 00000000..5760f3b1
+--- /dev/null
++++ b/kernel/kbox/kbox_proc.c
+@@ -0,0 +1,547 @@
++#include "kbox_include.h"
++#include <asm/io.h>
++#include <linux/mm.h>
++char kbox_ioc_buffer[KBOX_IOC_BUFFER_LEN];
++
++extern struct module *kbox_module;
++extern KBOX_MEMORY	kbox_memory_list;
++extern KBOX_DEV_CB	kbox_dev_cb;
++struct semaphore	kbox_sem_ddr;
++
++/*no need to protect proc delete for filesystem will protect file would not delete when open it
++   and before free region control block, we must delete region proc file first. so wen read region, control block
++   wouldn't be null
++*/
++static int kbox_proc_open (struct inode *inode, struct file *filp)
++{
++	struct proc_dir_entry * dp;
++	KBOX_REGION_CB* region_cb;
++	int ret = 0;
++	unsigned int *end_magic = NULL;
++	unsigned long flags;
++	dp = PDE(inode);
++
++	region_cb = dp->data;
++	if (!region_cb){
++		return -EINVAL;
++	}
++
++	KBOX_PRINTK_LOCK(&region_cb->logbuf_lock, flags);
++	if(region_cb->pregion_des->log_end != 0){
++		end_magic = (unsigned int *)(region_cb->log_buf + region_cb->pregion_des->log_end 
++			% region_cb->pregion_des->size);
++		if(*end_magic != KBOX_LOGBUF_END_MAGIC)
++		{
++			zero_log_buf(region_cb);
++			ret = -EIO;
++		}
++	}
++	KBOX_PRINTK_UNLOCK(&region_cb->logbuf_lock, flags);
++
++	if(ret < 0)
++		printk("kbox region %s end magic num error, cleared region and dumped memory!\n", region_cb->name);
++	
++	return ret;
++}
++
++static int kbox_proc_release (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static ssize_t kbox_proc_read(struct file *file, 
++	char __user *buffer, size_t buflen, loff_t *fpos)
++{
++	struct inode *inode = file->f_dentry->d_inode;
++	struct proc_dir_entry * dp;
++	KBOX_REGION_CB *cb;
++	int ret;
++
++	dp = PDE(inode);
++
++	cb = dp->data;
++	if (!cb){
++		return -EINVAL;
++	}
++	
++	ret = kbox_region_read(cb, 1, buffer, buflen, fpos);
++
++	return ret;
++}
++
++static ssize_t kbox_proc_write (struct file * filp, const char __user *   buffer, size_t count, loff_t * ppos)
++{
++	struct inode *inode = filp->f_dentry->d_inode;
++	struct proc_dir_entry *dp = NULL;
++	KBOX_REGION_CB *cb = NULL;
++	unsigned long flags;
++
++	if(count != 1){
++		printk("invalidate param!\n");
++		return (ssize_t)-EINVAL;;
++	}
++	
++	dp = PDE(inode);
++	cb = dp->data;
++	if (!cb){
++		return -EINVAL;
++	}
++
++	KBOX_PRINTK_LOCK(&cb->logbuf_lock, flags);
++	zero_log_buf(cb);
++	
++	KBOX_PRINTK_UNLOCK(&cb->logbuf_lock, flags);
++
++	return count;
++}
++
++
++/*kbox proc operation sets*/
++struct file_operations kbox_proc_file_operations = {
++	.owner =     THIS_MODULE,
++	.read =	    kbox_proc_read,
++	.write =      kbox_proc_write,
++	.open =	    kbox_proc_open,
++	.release =   kbox_proc_release,
++};
++
++static ssize_t kbox_proc_erase_write (struct file * filp, const char __user *   buffer, size_t count, loff_t * ppos)
++{
++	struct list_head *ptr = NULL;
++	KBOX_REGION_CB *entry = NULL;
++	int is_module_loaded = 0;
++	int ret = 0;
++	char flag[2];
++
++	if(kbox_dev_cb.dev_status != KBOX_DEV_STATUS_FS_OK)
++	{
++		printk("u should insert device first~\n");
++		return -ENODEV;
++	}
++	/*we just accept "1" for parameter*/
++	if(count != 2)
++	{
++		printk("invaild parameter\n");
++		return -EINVAL;
++	}
++	
++	if (down_interruptible(&kbox_sem) < 0){
++		/*-EINTR*/
++		return -EINTR;
++	}
++
++	if(copy_from_user(flag, buffer, 2))
++	{
++		printk("copy data fail or no data\n");
++		goto out;
++	}
++	
++	if(flag[0] == '1'){
++		list_for_each(ptr, &kbox_region_list){
++			entry = list_entry(ptr, KBOX_REGION_CB, list);
++			if (entry->module != NULL && find_module(entry->module_name) 
++				&& entry->module != kbox_module){
++				printk("%s working, we can not erase messages\n", 
++					entry->module_name);
++				is_module_loaded = 1;
++				break;
++			}
++		}
++		if(!is_module_loaded){
++			kbox_dev_cb.dev_status = KBOX_DEV_STATUS_FAULT;
++		
++			ret = kbox_erase_regions();
++			if(ret < 0){
++				printk("erase regions fail!\n");
++				goto out;
++			}
++
++			ret = kbox_create_default_reg();
++			if(ret < 0){
++				printk("create default region fail!\n");
++			}
++	
++			kbox_dev_cb.dev_status = KBOX_DEV_STATUS_FS_OK;
++		}
++		
++	}else{
++		printk("invild parameter, input \'1\' to erase kbox messages\n");
++		goto out;
++	}
++out:	
++	up(&kbox_sem);
++	return count;
++}
++
++static int kbox_proc_erase_open (struct inode *inode, struct file *filp)
++{
++	return 0;          /* success */
++}
++
++static int kbox_proc_earse_release (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++struct file_operations kbox_proc_erase_operations = {
++	.owner =     THIS_MODULE,
++	.write =      kbox_proc_erase_write,
++	.open =	    kbox_proc_erase_open,
++	.release =   kbox_proc_earse_release,
++};
++
++static int is_read_fini(KBOX_FS_HEAD *fs_head, loff_t *pos){
++	if(fs_head->file_count  > KBOX_DEV_FILES_SUPPORT_MAX)
++		return 1;
++
++	return *pos >= fs_head->file_count;
++}
++
++static void *ct_seq_start(struct seq_file *s, loff_t *pos)
++{
++	char* buff_temp = NULL;
++	static int total_size;
++
++	if(*pos == 0){
++		int ret;
++		
++		total_size = kbox_memory_list.fs_head->basic.data_offset;
++		if(total_size >= kbox_memory_list.memory_size && (total_size & (PAGE_SIZE-1)))
++		{
++			printk("kbox head length is long than mem size, %d\n", total_size);
++			return NULL;
++		}
++
++		buff_temp = kmalloc(total_size, GFP_KERNEL);
++		if (!buff_temp){
++			printk("kbox_proc_devinfo_read out of memory\n");
++			return NULL;
++		}
++
++		ret = down_interruptible(&kbox_sem);
++		if (ret < 0){
++			/*-EINTR*/
++			printk("down_interruptible fail");
++			kfree(buff_temp);
++			buff_temp = NULL;
++			return NULL;
++		}
++		
++		ret = kbox_device_read(kbox_dev_cb.dev_desc, buff_temp, total_size, 0);
++		if(ret != total_size)
++		{
++			up(&kbox_sem);
++			kfree(buff_temp);
++			buff_temp = NULL;
++			return NULL;
++		}
++
++		up(&kbox_sem);
++				
++		s->private = buff_temp;
++	}
++
++	buff_temp = s->private;
++	
++	if(buff_temp == NULL || (is_read_fini((KBOX_FS_HEAD*)buff_temp, pos) && *pos != 0)){
++		if(s->private != NULL){
++			kfree(s->private);
++			s->private = NULL;
++		}
++		return NULL;
++	}
++
++	return buff_temp+ ALIGN(sizeof(KBOX_FS_HEAD), 8) + (*pos)*(sizeof(KBOX_REGION_DESC));
++}
++
++static void *ct_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	KBOX_REGION_DESC *region_table = (KBOX_REGION_DESC *)v;
++	KBOX_FS_HEAD* fs_head = (KBOX_FS_HEAD*)s->private;
++
++	(*pos)++;
++
++	if(is_read_fini(fs_head, pos)){
++		return NULL;
++	}
++	
++	return region_table + 1; 
++}
++
++
++static void ct_seq_stop(struct seq_file *s, void *v)
++{
++	return ; 
++}
++
++static int ct_seq_show(struct seq_file *s, void *v)
++{
++	KBOX_REGION_DESC *region_table = (KBOX_REGION_DESC *)v;
++	KBOX_FS_HEAD* fs_head = (KBOX_FS_HEAD*)s->private;
++	KBOX_REGION_DESC *region_start = (KBOX_REGION_DESC*)((char *)s->private + ALIGN(sizeof(KBOX_FS_HEAD), 8));
++
++	if(region_table == region_start){
++		seq_printf (s, "device name:%s \n"
++			"*********************************************************\n"
++			"%-20s%12s%12s%12s\n",
++			kbox_dev_cb.dev_desc->device_name,
++			"region",
++			"start",
++			"regionsize",
++			"datasize");
++	}
++
++	if(region_table->name[0] != '\0' ){
++		seq_printf (s, "%-20s%12u%12u%12u\n",
++			region_table->name,
++			region_table->offset,
++			region_table->size,
++			region_table->real_size);
++	}
++
++	if(!fs_head->file_count||region_table - region_start == fs_head->file_count - 1){
++		seq_printf (s,
++			"*********************************************************\n"
++			"total:%ukb    used:%ukb    free:%ukb\n",
++			(uint)(kbox_dev_cb.dev_desc->size >> 10),
++			(uint)(kbox_memory_list.fs_head->basic.used_size >> 10),
++			(uint)((kbox_dev_cb.dev_desc->size - kbox_memory_list.fs_head->basic.used_size) >> 10));
++	}
++	return 0;
++}
++
++static const struct seq_operations ct_seq_ops = {
++	.start = ct_seq_start,
++	.next  = ct_seq_next,
++	.stop  = ct_seq_stop,
++	.show  = ct_seq_show
++};
++
++static int kbox_proc_devinfo_open (struct inode *inode, struct file *filp)
++{
++	struct proc_dir_entry * dp;
++	struct kbox_dev_des *dev_des;
++
++	dp = PDE(inode);
++
++	dev_des = dp->data;
++
++	if (dev_des == NULL){
++		printk("there is no device now\n");
++		return -ENODEV;
++	}
++
++	return seq_open(filp, &ct_seq_ops);;          /* success */
++}
++
++struct file_operations kbox_proc_devinfo_operations = {
++	.owner =     THIS_MODULE,
++	.read =       seq_read,
++	.open =	    kbox_proc_devinfo_open,
++	.release =   seq_release,
++	.llseek	= seq_lseek,
++};
++
++extern struct kbox_dev_des stDDRRamDevice;
++
++static ssize_t kbox_proc_mem_write (struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
++{
++	int ret;
++	struct kbox_dev_des *cb = &stDDRRamDevice;
++	char buffer[64] = {0}, *tmp = NULL;/*for address and size 64byte is enough*/
++    ulong value[2] = {0};
++	char *ddr_mmap_addr = NULL;
++
++    if (count >= (sizeof(buffer) - 1))
++              return -EINVAL;
++
++    if (copy_from_user(buffer, buf, count))
++               return -EFAULT;
++
++    value[0]  = memparse(buffer, &tmp);
++    if (*tmp == ' ')
++        value[1] = memparse(tmp + 1, NULL);	
++	
++	if (down_interruptible(&kbox_sem_ddr) < 0){
++		/*-EINTR*/
++		return -EINTR;
++	}
++
++	if(cb->op_mapped_addr != NULL){
++		printk("u already registered kbox mem\n");
++		ret = -EBUSY;
++		goto out;
++	}
++
++	ddr_mmap_addr = ioremap(value[0], value[1]);
++
++	 if (NULL == ddr_mmap_addr)
++    {
++        KBOX_DEBUG_TRACE();
++        printk(KERN_NOTICE "mapp kbox ddrram_address=%lx, \
++            ddrram_size=%lx fail", value[0], value[1]);
++        ret = -EADDRNOTAVAIL;
++    	goto out;
++	}
++
++    strncpy(cb->device_name, DDR_RAM_DEV_NAME, KBOX_DEV_NAME_MAXLEN);
++
++    cb->mode = KBOX_DEV_MODE_MAP;
++    cb->module = THIS_MODULE;
++    cb->show = NULL;
++    
++	cb->op_mapped_phy = value[0];
++    cb->size = value[1];
++	cb->op_mapped_addr = ddr_mmap_addr;
++    cb->vm_flag = VM_IO;
++	
++	ret = kbox_register_device(cb);
++	if( 0 > ret )
++    {
++		iounmap(ddr_mmap_addr);
++		cb->op_mapped_addr = NULL;
++        printk (KERN_NOTICE "[ERROR]:DDR Ram Driver Registeration to Kbox Failed\n");
++    }
++	ret = count;
++
++out:
++	up(&kbox_sem_ddr);
++	return ret;
++}
++
++static ssize_t kbox_proc_mem_read(struct file *file, char __user *buf,
++    size_t count, loff_t *ppos)
++{
++    char buffer[80];
++    if(kbox_dev_cb.dev_desc == NULL || kbox_dev_cb.dev_desc->op_mapped_addr == NULL)
++		return -ENODEV;
++
++	snprintf(buffer, sizeof(buffer), "0x%lx 0x%x\n",
++        kbox_dev_cb.dev_desc->op_mapped_phy, kbox_dev_cb.dev_desc->size);
++    return simple_read_from_buffer(buf, count, ppos, buffer, strlen(buffer));
++}
++
++
++static int kbox_proc_mem_open (struct inode *inode, struct file *filp)
++{
++	return 0;          /* success */
++}
++
++static int kbox_proc_mem_release (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++struct file_operations kbox_proc_mem_operations = {
++	.owner =     THIS_MODULE,
++	.write =     kbox_proc_mem_write,
++	.read =		kbox_proc_mem_read,
++	.open =	    kbox_proc_mem_open,
++	.release =   kbox_proc_mem_release,
++};
++
++
++static struct proc_dir_entry *kbox_proc_root;
++struct proc_dir_entry *kbox_proc_regions;
++static struct proc_dir_entry *kbox_proc_erase;
++struct proc_dir_entry *kbox_proc_devinfo;
++static struct proc_dir_entry *kbox_proc_mem;
++
++/*
++init  proc fs for kbox
++*/
++int kbox_proc_init(void)
++{
++	/*create kbox proc fs.
++				/proc/kbox
++						|--deviceinfo
++						|--erasure
++						|--regions
++								|--panic
++								|--
++
++	*/
++
++	/*create /proc/kbox*/
++	int ret = 0;
++	kbox_proc_root = proc_mkdir(KBOX_PROC_NAME, NULL);
++	/*Modification Start*/
++	if( NULL == kbox_proc_root ){
++		printk("Proc entry creation for KBOX_PROC_NAME failed\n");
++		return -1;
++	}
++
++	/*create /proc/kbox/devinfo*/
++	kbox_proc_devinfo= 
++		create_proc_entry(KBOX_PROC_NAME_DEVINFO, 0, kbox_proc_root);
++	if( NULL == kbox_proc_devinfo ){
++		printk("Proc entry creation for KBOX_PROC_NAME_DEVINFO failed\n");
++		ret = -1;
++		goto fail_DEV;
++	}
++	kbox_proc_devinfo->proc_fops = &kbox_proc_devinfo_operations;
++	kbox_proc_devinfo->size = KBOX_IOC_BUFFER_LEN;
++	kbox_proc_devinfo->data = NULL;
++
++	/*create /proc/kbox/erasure*/
++	kbox_proc_erase = 
++		create_proc_entry(KBOX_PROC_NAME_EREASE, 0200, kbox_proc_root);
++	if( NULL == kbox_proc_erase ){
++		printk("Proc entry creation for KBOX_PROC_NAME_EREASE failed\n");
++		ret = -1;
++		goto fail_ERA;
++	}
++	kbox_proc_erase->proc_fops = &kbox_proc_erase_operations;
++	kbox_proc_erase->size = 1;
++	kbox_proc_erase->data = NULL;
++
++	kbox_proc_mem = 
++		create_proc_entry(KBOX_PROC_NAME_MEM, 0644, kbox_proc_root);
++	if( NULL == kbox_proc_mem ){
++		printk("Proc entry creation for KBOX_PROC_NAME_EREASE failed\n");
++		ret = -1;
++		goto fail_MEM;
++	}
++	kbox_proc_mem->proc_fops = &kbox_proc_mem_operations;
++	kbox_proc_mem->size = 80;
++	kbox_proc_mem->data = NULL;
++	sema_init(&kbox_sem_ddr, 1);	
++
++	/*create /proc/kbox/regions*/
++	kbox_proc_regions = 
++		proc_mkdir(KBOX_PROC_NAME_REGION, kbox_proc_root);
++	if( NULL == kbox_proc_regions ){
++		printk("Proc entry creation for KBOX_PROC_NAME_REGION failed\n");
++		ret = -1;
++		goto fail_REG;
++	}
++	return 0;
++fail_REG:
++	remove_proc_entry(KBOX_PROC_NAME_MEM, kbox_proc_root);
++	
++fail_MEM:
++	remove_proc_entry(KBOX_PROC_NAME_EREASE, kbox_proc_root);
++
++fail_ERA:
++	remove_proc_entry(KBOX_PROC_NAME_DEVINFO, kbox_proc_root);
++
++fail_DEV:
++	remove_proc_entry(KBOX_PROC_NAME, NULL);
++
++	return ret;
++}
++
++/*
++cleanup proc fs for kbox.
++*/
++void kbox_proc_fini(void)
++{
++	/*delete /proc/kbox*/
++	remove_proc_entry(KBOX_PROC_NAME_REGION, kbox_proc_root);
++	remove_proc_entry(KBOX_PROC_NAME_EREASE, kbox_proc_root);
++	remove_proc_entry(KBOX_PROC_NAME_DEVINFO, kbox_proc_root);
++	remove_proc_entry(KBOX_PROC_NAME_MEM, kbox_proc_root);
++	remove_proc_entry(KBOX_PROC_NAME, NULL);
++}
++
++
+diff --git a/kernel/kbox/kbox_proc.h b/kernel/kbox/kbox_proc.h
+new file mode 100644
+index 00000000..a1cdee8f
+--- /dev/null
++++ b/kernel/kbox/kbox_proc.h
+@@ -0,0 +1,27 @@
++#ifndef _KBOX_PROC_H
++#define _KBOX_PROC_H
++
++#include <linux/ioctl.h>
++#include <linux/cdev.h>
++
++#define KBOX_PROC_NAME			"kbox"
++#define KBOX_PROC_NAME_EREASE	"erasure"
++#define KBOX_PROC_NAME_REGION	"regions"
++#define KBOX_PROC_NAME_DEVINFO	"deviceinfo"
++#define KBOX_PROC_NAME_MEM		"mem"
++
++
++#define KBOX_IOC_BUFFER_LEN (4096)
++
++
++
++extern char kbox_ioc_buffer[KBOX_IOC_BUFFER_LEN];
++extern struct proc_dir_entry *kbox_proc_regions;
++extern struct proc_dir_entry *kbox_proc_devinfo;
++
++extern struct file_operations kbox_proc_file_operations;
++
++extern int	kbox_proc_init(void);
++extern void	kbox_proc_fini(void);
++
++#endif
+diff --git a/kernel/printk.c b/kernel/printk.c
+index 8ace9f8e..3bf78beb 100644
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -38,7 +38,9 @@
+ #include <linux/syslog.h>
+ 
+ #include <asm/uaccess.h>
+-
++#ifdef CONFIG_KBOX
++#include <linux/set_kbox_region.h>
++#endif
+ /*
+  * for_each_console() allows you to iterate on each console
+  */
+@@ -440,6 +442,34 @@ static int __init ignore_loglevel_setup(char *str)
+ 
+ early_param("ignore_loglevel", ignore_loglevel_setup);
+ 
++#if (defined CONFIG_KBOX) || (defined CONFIG_EARLY_KBOX)
++static DECLARE_MUTEX(nolevel_console_sem);
++struct console *nolevel_console_drivers = NULL;
++EXPORT_SYMBOL(nolevel_console_drivers);
++
++/*add a console to nolevel_console_drivers*/
++void register_nolevel_console(struct console *newcon)
++{
++	BUG_ON(in_interrupt());
++	down(&nolevel_console_sem);
++	nolevel_console_drivers = newcon;
++	up(&nolevel_console_sem);
++}
++EXPORT_SYMBOL(register_nolevel_console);
++
++void call_nolevel_console_drivers(unsigned start, unsigned end)
++{
++	/*
++	 * nolevel_console_drivers may change as NULL during copying work,
++	 * we define con to keep the pointer
++	 */
++	struct console *con = nolevel_console_drivers;
++	if (con &&(con ->flags & CON_ENABLED) && con ->write &&
++	    (cpu_online(smp_processor_id()) ||(con ->flags & CON_ANYTIME)))
++		con ->write(con, &LOG_BUF(start), end - start);
++}
++#endif
++
+ /*
+  * Write out chars from start to end - 1 inclusive
+  */
+@@ -669,6 +699,9 @@ asmlinkage int vprintk(const char *fmt, va_list args)
+ 	unsigned long flags;
+ 	int this_cpu;
+ 	char *p;
++#ifdef CONFIG_KBOX
++	int kbox_reg_id = 0;
++#endif
+ 
+ 	boot_delay_msec();
+ 	printk_delay();
+@@ -709,7 +742,10 @@ asmlinkage int vprintk(const char *fmt, va_list args)
+ 	printed_len += vscnprintf(printk_buf + printed_len,
+ 				  sizeof(printk_buf) - printed_len, fmt, args);
+ 
+-
++#ifdef CONFIG_KBOX
++	kbox_reg_id = get_kbox_region();
++	kern_kbox_write(kbox_reg_id, printk_buf, printed_len);
++#endif
+ 	p = printk_buf;
+ 
+ 	/* Do we have a loglevel in the string? */
+diff --git a/kernel/sched.c b/kernel/sched.c
+index 245458e5..df99a84d 100644
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -81,6 +81,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+ 
++#ifdef CONFIG_KBOX
++#include <linux/set_kbox_region.h>
++#include <asm/atomic.h>
++#endif
+ /*
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+  * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
+@@ -5214,6 +5218,9 @@ void __cpuinit init_idle(struct task_struct *idle, int cpu)
+ {
+ 	struct rq *rq = cpu_rq(cpu);
+ 	unsigned long flags;
++#ifdef CONFIG_KBOX
++	atomic_set(&idle->kbox_region_conf, KBOX_CONF_PANIC);
++#endif
+ 
+ 	raw_spin_lock_irqsave(&rq->lock, flags);
+ 
+diff --git a/kernel/set_kbox_region.c b/kernel/set_kbox_region.c
+new file mode 100644
+index 00000000..9c817193
+--- /dev/null
++++ b/kernel/set_kbox_region.c
+@@ -0,0 +1,160 @@
++#include <linux/sched.h>
++#include <linux/hardirq.h>
++#include <linux/module.h>
++#include <linux/set_kbox_region.h>
++#include <asm/current.h>
++#include <asm/atomic.h>
++
++/*
++ * kbox_region_conf
++ * 
++ * |__context__|__nesting_level__|__region_symbol__|
++ *     3byte         5byte             8byte
++ */
++
++static kbox_create_region_func_t kbox_create_region_hook = NULL;
++static kbox_write_func_t kbox_write_hook =NULL;
++
++static DEFINE_SPINLOCK(kbox_lock);
++
++/*
++ * call by kbox to register his create region function and kbox_write fuction into kernel hook
++ */
++
++void register_kbox_callback(kbox_create_region_func_t create_func,
++		kbox_write_func_t write_func)
++{
++	spin_lock(&kbox_lock);
++	rcu_assign_pointer(kbox_create_region_hook, create_func);
++	rcu_assign_pointer(kbox_write_hook, write_func);
++	spin_unlock(&kbox_lock);
++
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(register_kbox_callback);
++
++/*
++ * using by kernel where register a region from kbox
++ */
++int kern_kbox_register_region(const char *name, size_t size, struct module *mod)
++{
++	kbox_create_region_func_t  func = NULL;
++	int ret = -ENODEV;
++
++	struct kbox_region region;
++	strncpy(region.name, name, KBOX_REGION_NAME_LEN);
++	region.name[KBOX_REGION_NAME_LEN - 1] = '\0';
++	region.size = size;
++	region.mod = mod;
++
++	rcu_read_lock();
++
++	func = rcu_dereference(kbox_create_region_hook);
++	if (func) {
++		ret = func(&region);
++	}
++
++	rcu_read_unlock();
++
++	return ret;
++}
++EXPORT_SYMBOL(kern_kbox_register_region);
++
++
++/*
++ * using by kernel where write data to kbox
++ */
++int kern_kbox_write(int fd, const char *buf, unsigned len)
++{
++	kbox_write_func_t func = NULL;
++	int ret = -ENODEV;
++
++	rcu_read_lock();
++	func = rcu_dereference(kbox_write_hook);
++	if (func) {
++		ret = func(fd, buf, len);
++	}
++
++	rcu_read_unlock();
++	return ret;
++}
++
++EXPORT_SYMBOL(kern_kbox_write);
++
++
++/*
++ * use the region symbol(defined in a enumerate) and return kbox_region_conf
++ */
++static int inline make_region_config(int symbol)
++{
++	int config_ret;
++	if(symbol < 0)
++	{
++		symbol = KBOX_DEFAULT_REG_ID;
++	}
++
++	config_ret = symbol;	
++
++	if (in_irq()) {
++		config_ret |= HARDIRQ_CONTEXT;
++		config_ret |= preempt_count() & HARDIRQ_MASK;
++	} else if (in_softirq()) {
++		config_ret |= SOFTIRQ_CONTEXT;
++	} else {
++		config_ret |= PROCESS_CONTEXT;
++	}
++
++	return config_ret;
++}
++
++/*
++ * intialize kbox_region_conf as the process context with panic region state
++ */
++void init_kbox_region(struct task_struct *p)
++{
++	atomic_set(&p->kbox_region_conf, PROCESS_CONTEXT | KBOX_DEFAULT_REG_ID);
++}
++
++/*
++ * refresh the kbox_region_conf setting, and return the old setting value
++ */
++int set_kbox_region(int mod_region)
++{	
++	int new_setting = make_region_config(mod_region);
++	int old_setting = atomic_read(&current->kbox_region_conf);
++
++	if(mod_region < 0 )
++	{
++		new_setting = make_region_config(KBOX_DEFAULT_REG_ID);
++	}
++	atomic_set(&current->kbox_region_conf, new_setting);
++
++	return old_setting;
++}
++EXPORT_SYMBOL(set_kbox_region);
++
++void restore_kbox_region(int old_setting)
++{
++	if(((old_setting) < 0 ) ||
++			((old_setting & CONTEXT_MASK) > HARDIRQ_CONTEXT))
++	{
++		old_setting = make_region_config(KBOX_DEFAULT_REG_ID);
++	}
++	atomic_set(&current->kbox_region_conf, old_setting);
++}
++EXPORT_SYMBOL(restore_kbox_region);
++
++int get_kbox_region(void)
++{	
++	int setting = atomic_read(&current->kbox_region_conf);
++	int cur_setting = make_region_config(KBOX_DEFAULT_REG_ID);
++
++	if ((setting & CONTEXT_LEVEL_MASK) == (cur_setting & CONTEXT_LEVEL_MASK)) {
++		return setting & REGIONID_MASK;
++	}
++	/*default*/
++	return KBOX_DEFAULT_REG_ID;	
++}
++EXPORT_SYMBOL(get_kbox_region);
++
++
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 935248bd..2cff2b3b 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -1,3 +1,17 @@
++config KBOX
++        bool "send print message into kbox"
++	default y
++	help
++	  use this option make the printk message write into kbox memory, then
++	  even system reboot these message can been saved. need the kbox module
++	  insmod.
++
++config KBOX_MAX_REG
++	int "kbox support max region number"
++	default 64
++	help
++	  max regions number the kbox support, be careful the number would let kbox
++	  control brock takes more space
+ 
+ config PRINTK_TIME
+ 	bool "Show timing information on printks"
+-- 
+2.12.3
+
